@@ -100,6 +100,12 @@ cmd_keychain_open() {
   echo "Keychain ready at $kc"
 }
 
+# `|| true` is load-bearing, not tidiness. A caller that kept the keychain
+# closes it by invoking the action again with mode: close under
+# `if: always()`, so this runs after failures that happened before a keychain
+# was ever created, and real `security delete-keychain` exits nonzero with
+# "The specified keychain could not be found." when there is nothing to
+# delete. Swallowing that is what makes the close safe to call unconditionally.
 cmd_keychain_close() {
   local kc; kc="$(keychain_path)"
   security delete-keychain "$kc" || true
@@ -205,10 +211,14 @@ cmd_notarize() {
   fi
 
   local json status parse_rc=0
+  # --wait on its own is unbounded, so a stall at Apple's end would sit here
+  # until GitHub killed the job at its 360-minute ceiling, six hours of a
+  # macOS runner spent learning nothing. --timeout makes notarytool give up
+  # and exit nonzero inside the hour instead.
   json="$(xcrun notarytool submit "$payload" \
             --key "$p8" --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
-            --wait --output-format json)"
+            --wait --timeout "${NOTARY_TIMEOUT:-1h}" --output-format json)"
   rm -f "$p8"
   # `|| parse_rc=$?` rather than a bare command substitution: under `set -e`
   # a failing `status="$(...)"` would otherwise abort the script right here,

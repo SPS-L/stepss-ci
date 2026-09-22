@@ -3,9 +3,21 @@ description: >
   Signs Mach-O files with the Cyprus University of Technology Developer ID
   certificate and submits them to Apple's notary service.
 
+# No `${{ }}` expression is ever interpolated into the text of a `run:`
+# script. Everything a script needs arrives through `env:` and is read as a
+# quoted shell variable, because `${{ }}` is a textual substitution performed
+# before bash sees the line: a caller passing `paths: 'a";id;"'` would
+# otherwise close the quote and run arbitrary commands in a step holding the
+# signing identity and the notary key. This is the same rule the note at the
+# top of stepss-java-ui's release.yml states, and it applies here for the
+# same reason. Keep it that way when adding steps. `if:` conditions are
+# expressions rather than script text and are not covered by this.
+
 inputs:
   mode:
-    description: "sign, notarize, or sign-and-notarize"
+    description: >
+      sign, notarize, sign-and-notarize, or close. `close` does nothing but
+      remove the keychain, for a caller that opened one with keep-keychain.
     required: false
     default: sign-and-notarize
   paths:
@@ -20,6 +32,13 @@ inputs:
     description: "Override the entitlements plist."
     required: false
     default: ""
+  keep-keychain:
+    description: >
+      Leave the keychain in place for the rest of the job, so that a later
+      step can use keychain-path. The caller must then close it, by invoking
+      this action again with mode: close under `if: always()`.
+    required: false
+    default: "false"
 
 outputs:
   keychain-path:
@@ -33,19 +52,23 @@ runs:
   using: composite
   steps:
     - name: Preflight
+      if: inputs.mode != 'close'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         SIGN_NOTARIZE: ${{ inputs.mode == 'sign' && 'false' || 'true' }}
-      run: bash "${{ github.action_path }}/sign.sh" preflight
+      run: bash "$ACTION_PATH/sign.sh" preflight
 
     - name: Open the keychain
       id: open
-      if: inputs.mode != 'notarize'
+      if: inputs.mode != 'notarize' && inputs.mode != 'close'
       shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
       run: |
         set -euo pipefail
-        bash "${{ github.action_path }}/sign.sh" keychain-open
-        identity="$(bash "${{ github.action_path }}/sign.sh" identity)"
+        bash "$ACTION_PATH/sign.sh" keychain-open
+        identity="$(bash "$ACTION_PATH/sign.sh" identity)"
         echo "identity=$identity" >> "$GITHUB_OUTPUT"
         echo "keychain=$RUNNER_TEMP/stepss-signing.keychain-db" >> "$GITHUB_OUTPUT"
         # The certificate is read back from the keychain rather than from the
@@ -54,13 +77,15 @@ runs:
         not_after="$(security find-certificate -p -c "Developer ID Application" \
                      "$RUNNER_TEMP/stepss-signing.keychain-db" \
                      | openssl x509 -noout -enddate | cut -d= -f2)"
-        bash "${{ github.action_path }}/sign.sh" cert-expiry "$not_after"
+        bash "$ACTION_PATH/sign.sh" cert-expiry "$not_after"
 
     - name: Sign
-      if: inputs.paths != '' && inputs.mode != 'notarize'
+      if: inputs.paths != '' && inputs.mode != 'notarize' && inputs.mode != 'close'
       shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         SIGN_ENTITLEMENTS: ${{ inputs.entitlements }}
+        PATHS: ${{ inputs.paths }}
       run: |
         set -euo pipefail
         # mapfile needs bash 4.0; the macOS runner's shell: bash is Apple's
@@ -69,7 +94,7 @@ runs:
         files=()
         while IFS= read -r f; do
           files+=("$f")
-        done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+        done < <(printf '%s\n' "$PATHS" | sed '/^[[:space:]]*$/d')
         # A whitespace-only paths input passes this step's own `if:` guard
         # above but leaves $files empty. "${files[@]}" on a zero-element
         # array raises "unbound variable" under bash 3.2's `set -u` (fixed in
@@ -79,21 +104,25 @@ runs:
         # `[ "$#" -gt 0 ]` check is what reports the empty input, not a
         # shell abort.
         if [ "${#files[@]}" -eq 0 ]; then
-          bash "${{ github.action_path }}/sign.sh" sign
+          bash "$ACTION_PATH/sign.sh" sign
         else
-          bash "${{ github.action_path }}/sign.sh" sign "${files[@]}"
-          bash "${{ github.action_path }}/sign.sh" verify "${files[@]}"
+          bash "$ACTION_PATH/sign.sh" sign "${files[@]}"
+          bash "$ACTION_PATH/sign.sh" verify "${files[@]}"
         fi
 
     - name: Notarize
-      if: inputs.mode != 'sign'
+      if: inputs.mode != 'sign' && inputs.mode != 'close'
       shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        PATHS: ${{ inputs.paths }}
+        BUNDLE: ${{ inputs.bundle }}
       run: |
         set -euo pipefail
-        if [ -n "${{ inputs.bundle }}" ]; then
-          bash "${{ github.action_path }}/sign.sh" notarize "${{ inputs.bundle }}"
-          bash "${{ github.action_path }}/sign.sh" staple "${{ inputs.bundle }}"
-          bash "${{ github.action_path }}/sign.sh" assess "${{ inputs.bundle }}"
+        if [ -n "$BUNDLE" ]; then
+          bash "$ACTION_PATH/sign.sh" notarize "$BUNDLE"
+          bash "$ACTION_PATH/sign.sh" staple "$BUNDLE"
+          bash "$ACTION_PATH/sign.sh" assess "$BUNDLE"
         else
           # Same bash-3.2 constraints as the Sign step above: build the
           # array with a read loop rather than mapfile, and check its count
@@ -105,21 +134,44 @@ runs:
           files=()
           while IFS= read -r f; do
             files+=("$f")
-          done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+          done < <(printf '%s\n' "$PATHS" | sed '/^[[:space:]]*$/d')
           if [ "${#files[@]}" -eq 0 ]; then
-            bash "${{ github.action_path }}/sign.sh" notarize
+            bash "$ACTION_PATH/sign.sh" notarize
           else
-            bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
+            bash "$ACTION_PATH/sign.sh" notarize "${files[@]}"
             # Every file, not just the first. This used to pass
             # "${files[0]}", which left helios's libhelios_api.dylib and
             # ramses's ramses.so unassessed. sign.sh assess takes a list and
             # loops inside, so the shell here expands the array once, under
             # the same count guard, and no loop of its own is needed.
-            bash "${{ github.action_path }}/sign.sh" assess "${files[@]}"
+            bash "$ACTION_PATH/sign.sh" assess "${files[@]}"
           fi
         fi
 
+    # This is NOT a post step, and it cannot be made one: `runs.post` is
+    # available to JavaScript and Docker actions only, and a composite
+    # action has no equivalent. Every step here runs inline inside the one
+    # calling step, so this executes when the call returns, not when the job
+    # ends. Do not "fix" it into a `post:`; it would be ignored, and the
+    # keychain would outlive the job with the signing identity in it.
+    #
+    # That inline timing is why keep-keychain exists. A caller that needs the
+    # keychain after the call returns, as stepss-java-ui does when it hands
+    # keychain-path to jpackage's --mac-signing-keychain, sets
+    # keep-keychain: true and is then responsible for calling this action
+    # again with mode: close under `if: always()`. Without that input the
+    # keychain was deleted before the calling workflow's next step could ever
+    # see it, which made keychain-path an output naming a file that no longer
+    # existed.
+    #
+    # mode: close always closes, whatever keep-keychain says, because that is
+    # the entire purpose of the mode. sign.sh keychain-close succeeds when
+    # there is no keychain to remove, which matters because the caller runs
+    # this under `if: always()` and the failure may have come before one was
+    # ever created.
     - name: Close the keychain
-      if: always()
+      if: always() && (inputs.mode == 'close' || inputs.keep-keychain != 'true')
       shell: bash
-      run: bash "${{ github.action_path }}/sign.sh" keychain-close
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+      run: bash "$ACTION_PATH/sign.sh" keychain-close

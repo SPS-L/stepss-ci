@@ -18,7 +18,7 @@ ARGV_LOG="$TMPD/argv.log"
 # so that a test can assert on what the script actually invoked, and honours
 # FAKE_<TOOL>_EXIT so that a test can force a failure.
 export ARGV_LOG
-for tool in security xcrun; do
+for tool in xcrun; do
   cat > "$FAKEBIN/$tool" <<EOF
 #!/usr/bin/env bash
 echo "$tool \$*" >> "$ARGV_LOG"
@@ -59,6 +59,35 @@ fi
 exit "\${FAKE_DITTO_EXIT:-0}"
 EOF
 chmod +x "$FAKEBIN/ditto"
+
+# security gets a dedicated fake because the generic "log argv, exit 0"
+# template made `keychain-close` untestable: it exited 0 whether or not there
+# was a keychain, so `security delete-keychain || true` looked safe without
+# anything proving it. That `|| true` is what lets a caller close a keychain
+# under `if: always()` after a failure that happened before one existed, so
+# it needs a fake that can actually reject the call. This one tracks the
+# keychain file: create-keychain creates it, delete-keychain removes it and
+# fails the way the real tool does when it is not there.
+cat > "$FAKEBIN/security" <<'EOF'
+#!/usr/bin/env bash
+echo "security $*" >> "$ARGV_LOG"
+sub="${1:-}"
+kc=""
+for a in "$@"; do case "$a" in *.keychain-db) kc="$a" ;; esac; done
+case "$sub" in
+  create-keychain) [ -n "$kc" ] && : > "$kc" ;;
+  delete-keychain)
+    if [ -n "$kc" ] && [ ! -e "$kc" ]; then
+      echo "security: SecKeychainDelete: The specified keychain could not be found." >&2
+      exit 1
+    fi
+    [ -n "$kc" ] && rm -f "$kc"
+    ;;
+esac
+[ -n "${FAKE_SECURITY_OUT:-}" ] && printf '%s\n' "$FAKE_SECURITY_OUT"
+exit "${FAKE_SECURITY_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/security"
 
 # codesign gets a dedicated fake rather than the generic "log argv, exit 0"
 # template, so that a test can fail one named file and not the others:
@@ -243,6 +272,39 @@ out="$(run_sign keychain-close)"; rc=$?
 grep -q 'security delete-keychain' "$ARGV_LOG" \
   && ok "keychain-close deletes the keychain" || fail "no delete in: $(cat "$ARGV_LOG")"
 
+# The keychain's lifetime, which is the whole of the keep-keychain story.
+# `Close the keychain` is an ordinary step of a composite action, not a post
+# step (composite actions have no `runs.post`), so it runs when the call
+# returns rather than when the job ends. A caller that needs the keychain
+# afterwards, as stepss-java-ui does when it passes keychain-path to
+# jpackage's --mac-signing-keychain, sets keep-keychain: true and closes it
+# itself later with mode: close.
+KC="$TMPD/stepss-signing.keychain-db"
+rm -f "$KC"
+out="$(run_sign keychain-open)"; rc=$?
+[ -e "$KC" ] && ok "keychain-open creates the keychain file" \
+             || fail "keychain-open left no keychain at $KC: $out"
+out="$(run_sign keychain-close)"; rc=$?
+[ ! -e "$KC" ] && ok "keychain-close removes the keychain file" \
+               || fail "keychain-close left $KC behind: $out"
+
+# mode: close runs under `if: always()`, so it is called after failures that
+# happened before a keychain existed. sign.sh keychain-close swallows the
+# delete failure with `|| true` and that is confirmed here rather than
+# assumed: the assertion below is only worth anything because the fake
+# security really does reject the call, which this checks first.
+rm -f "$KC"
+if security delete-keychain "$KC" >/dev/null 2>&1; then
+  fail "the fake security accepted deleting a keychain that does not exist"
+else
+  ok "the fake security rejects deleting a keychain that does not exist"
+fi
+out="$(run_sign keychain-close)"; rc=$?
+[ "$rc" = 0 ] && ok "keychain-close succeeds when there is no keychain" \
+               || fail "keychain-close exited $rc with no keychain present: $out"
+case "$out" in *"Keychain removed"*) ok "keychain-close reports removal even when there was nothing to remove" ;;
+               *) fail "keychain-close said nothing: $out" ;; esac
+
 # ---- sign and verify -----------------------------------------------------
 : > "$TMPD/ramses"; : > "$TMPD/ramses.so"
 out="$(FAKE_SECURITY_OUT="$one_identity" run_sign sign "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
@@ -285,6 +347,10 @@ grep -q 'xcrun notarytool submit' "$ARGV_LOG" \
   && ok "notarize submits" || fail "no submit: $(cat "$ARGV_LOG")"
 grep -q -- '--wait' "$ARGV_LOG" \
   && ok "notarize waits for the verdict" || fail "no --wait"
+# --wait alone is unbounded: a stall at Apple's end would run to GitHub's
+# 360-minute job ceiling before anyone found out.
+grep -q -- '--timeout' "$ARGV_LOG" \
+  && ok "notarize bounds the wait with a timeout" || fail "no --timeout: $(cat "$ARGV_LOG")"
 grep -q '69a6de82-68c9-47e3-e053-5b8c7c11a4d1' "$ARGV_LOG" \
   && ok "notarize passes the issuer id" || fail "no issuer id: $(cat "$ARGV_LOG")"
 grep -q 'ditto ' "$ARGV_LOG" \
@@ -474,6 +540,53 @@ out="$(run_sign assess "$TMPD/STEPSS.app")"; rc=$?
 grep -q -- 'spctl --assess --type execute' "$ARGV_LOG" \
   && ok "an .app is assessed by spctl as executable code" \
   || fail "no execute assessment for an .app: $(cat "$ARGV_LOG")"
+
+# ---- action.yml ----------------------------------------------------------
+# The composite action's own behaviour cannot be executed here: nothing in
+# this suite invokes GitHub Actions, and its `if:` conditions are evaluated
+# by the runner, not by bash. What follows checks the text of action.yml
+# instead. That proves the gates are written, not that GitHub reads them the
+# way intended, and it is here because the alternative is no check at all on
+# the file where every defect so far has been found by a real run.
+ACTION="$ROOT/action.yml"
+
+grep -qE '^  keep-keychain:' "$ACTION" \
+  && ok "the action declares a keep-keychain input" || fail "no keep-keychain input"
+grep -qE '^    default: "false"' "$ACTION" \
+  && ok "keep-keychain defaults to false, so the four engine callers are unaffected" \
+  || fail "keep-keychain does not default to false"
+
+close_if="$(grep -E "^[[:space:]]*if: always\(\)" "$ACTION" || true)"
+case "$close_if" in *"inputs.keep-keychain != 'true'"*)
+       ok "the closing step is skipped when the caller keeps the keychain" ;;
+     *) fail "the closing step is not gated on keep-keychain: $close_if" ;; esac
+case "$close_if" in *"inputs.mode == 'close'"*)
+       ok "mode: close closes the keychain whatever keep-keychain says" ;;
+     *) fail "mode: close does not force the close: $close_if" ;; esac
+
+# Preflight, Open, Sign and Notarize must all stand down in close mode, or
+# `mode: close` would demand credentials and try to notarize nothing.
+[ "$(grep -c "inputs.mode != 'close'" "$ACTION")" = 4 ] \
+  && ok "every other step is gated off close mode" \
+  || fail "$(grep -c "inputs.mode != 'close'" "$ACTION") steps gated off close mode, expected 4"
+
+# Composite actions have no runs.post. The closing step is an ordinary step
+# and must stay one; a post: key here would be silently ignored.
+grep -qE '^[[:space:]]*post:' "$ACTION" \
+  && fail "action.yml declares a post step, which a composite action cannot have" \
+  || ok "the closing step is not declared as a post step"
+
+# The rule from the note at the top of stepss-java-ui's release.yml: no
+# ${{ }} expression is interpolated into the text of a run: script, because
+# that substitution happens before bash sees the line. Every remaining
+# occurrence must be an env: assignment, an if:, a value: or a default:.
+interp="$(grep -n '\${{' "$ACTION" \
+          | grep -vE '^[0-9]+:[[:space:]]*#' \
+          | grep -vE '^[0-9]+:[[:space:]]*(if|value|default):' \
+          | grep -vE '^[0-9]+:[[:space:]]+[A-Za-z_][A-Za-z0-9_]*:[[:space:]]*\$\{\{' || true)"
+[ -z "$interp" ] \
+  && ok "no expression is interpolated into a run: body" \
+  || fail "an expression is interpolated into a run: body: $interp"
 
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
