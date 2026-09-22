@@ -40,6 +40,7 @@ runs:
 
     - name: Open the keychain
       id: open
+      if: inputs.mode != 'notarize'
       shell: bash
       run: |
         set -euo pipefail
@@ -62,7 +63,13 @@ runs:
         SIGN_ENTITLEMENTS: ${{ inputs.entitlements }}
       run: |
         set -euo pipefail
-        mapfile -t files < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+        # mapfile needs bash 4.0; the macOS runner's shell: bash is Apple's
+        # stock /bin/bash 3.2.57, so the array is built with a read loop
+        # instead.
+        files=()
+        while IFS= read -r f; do
+          files+=("$f")
+        done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
         bash "${{ github.action_path }}/sign.sh" sign "${files[@]}"
         bash "${{ github.action_path }}/sign.sh" verify "${files[@]}"
 
@@ -76,7 +83,11 @@ runs:
           bash "${{ github.action_path }}/sign.sh" staple "${{ inputs.bundle }}"
           bash "${{ github.action_path }}/sign.sh" assess "${{ inputs.bundle }}"
         else
-          mapfile -t files < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+          # Same bash-3.2 constraint as the Sign step above.
+          files=()
+          while IFS= read -r f; do
+            files+=("$f")
+          done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
           bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
           bash "${{ github.action_path }}/sign.sh" assess "${files[0]}"
         fi

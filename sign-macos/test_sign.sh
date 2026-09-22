@@ -163,9 +163,17 @@ grep -q -- '--verify --strict' "$ARGV_LOG" \
   && ok "verify is strict" || fail "verify not strict: $(cat "$ARGV_LOG")"
 
 # ---- notarize ------------------------------------------------------------
-accepted='{"id":"abc-123","status":"Accepted"}'
+# notarytool's --output-format json is Swift's JSONEncoder: it pretty-prints
+# with a space either side of the colon ("status" : "Accepted") across
+# several lines. These fixtures use that real shape, so a status/id
+# extraction that regresses to a compact "status":"..." substring or sed
+# match fails here (it did: see the fix-round report for the reproduction).
+accepted='{
+  "id" : "abc-123",
+  "status" : "Accepted"
+}'
 out="$(FAKE_XCRUN_OUT="$accepted" run_sign notarize "$TMPD/ramses")"; rc=$?
-[ "$rc" = 0 ] && ok "notarize succeeds on Accepted" || fail "notarize: $out"
+[ "$rc" = 0 ] && ok "notarize succeeds on Accepted (pretty-printed JSON)" || fail "notarize: $out"
 grep -q 'xcrun notarytool submit' "$ARGV_LOG" \
   && ok "notarize submits" || fail "no submit: $(cat "$ARGV_LOG")"
 grep -q -- '--wait' "$ARGV_LOG" \
@@ -175,7 +183,16 @@ grep -q '69a6de82-68c9-47e3-e053-5b8c7c11a4d1' "$ARGV_LOG" \
 grep -q 'ditto ' "$ARGV_LOG" \
   && ok "notarize builds a zip with ditto" || fail "no ditto call"
 
-invalid='{"id":"abc-123","status":"Invalid"}'
+# Compact JSON never comes from notarytool itself, but the parser must not
+# be tied to either shape.
+accepted_compact='{"id":"abc-123","status":"Accepted"}'
+out="$(FAKE_XCRUN_OUT="$accepted_compact" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ "$rc" = 0 ] && ok "notarize succeeds on Accepted (compact JSON)" || fail "notarize compact: $out"
+
+invalid='{
+  "id" : "abc-123",
+  "status" : "Invalid"
+}'
 out="$(FAKE_XCRUN_OUT="$invalid" run_sign notarize "$TMPD/ramses")"; rc=$?
 [ "$rc" = 1 ] && ok "notarize fails on Invalid" || fail "notarize exited $rc on Invalid"
 case "$out" in *Invalid*) ok "the failure reports the status" ;;

@@ -143,6 +143,18 @@ cmd_verify() {
   done
 }
 
+# notarytool's --output-format json is emitted by Swift's JSONEncoder, which
+# pretty-prints with a space either side of the colon ("status" : "Accepted")
+# and across multiple lines. A sed/substring match tuned to compact JSON
+# silently returns empty against that shape, so this parses for real.
+# python3 ships on every macOS runner.
+json_field() {
+  local field="$1"
+  python3 -c 'import json, sys
+d = json.load(sys.stdin)
+print(d.get(sys.argv[1], ""))' "$field"
+}
+
 cmd_notarize() {
   [ "$#" -gt 0 ] || { echo "sign.sh: notarize needs at least one file" >&2; exit 2; }
   require_var APPLE_NOTARY_KEY_P8
@@ -170,10 +182,10 @@ cmd_notarize() {
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
             --wait --output-format json)"
   rm -f "$p8"
-  status="$(printf '%s' "$json" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  status="$(printf '%s' "$json" | json_field status)"
   echo "notarytool status: $status"
   if [ "$status" != "Accepted" ]; then
-    local id; id="$(printf '%s' "$json" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+    local id; id="$(printf '%s' "$json" | json_field id)"
     echo "sign.sh: notarization was not accepted (status: $status)." >&2
     # Apple's reason is the only actionable part and lives behind a second
     # call, so it is fetched here rather than left for someone to run by hand.
