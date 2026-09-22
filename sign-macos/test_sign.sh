@@ -14,29 +14,52 @@ trap 'rm -rf "$TMPD"' EXIT
 FAKEBIN="$TMPD/fakebin"; mkdir -p "$FAKEBIN"
 ARGV_LOG="$TMPD/argv.log"
 
-# One fake per Apple tool. Each appends its own name and arguments to the log
-# so that a test can assert on what the script actually invoked, and honours
-# FAKE_<TOOL>_EXIT so that a test can force a failure.
 export ARGV_LOG
-for tool in xcrun; do
-  cat > "$FAKEBIN/$tool" <<EOF
-#!/usr/bin/env bash
-echo "$tool \$*" >> "$ARGV_LOG"
-var="FAKE_\$(echo "$tool" | tr '[:lower:]' '[:upper:]')_EXIT"
-out_var="FAKE_\$(echo "$tool" | tr '[:lower:]' '[:upper:]')_OUT"
-[ -n "\${!out_var:-}" ] && printf '%s\n' "\${!out_var}"
-exit "\${!var:-0}"
-EOF
-  chmod +x "$FAKEBIN/$tool"
-done
 
-# ditto gets a dedicated fake rather than the generic template above: it is
-# the one tool sign.sh calls in a mode (-c, archive creation) where the real
-# tool enforces a contract on argument count ("ditto: Can't archive multiple
-# sources"). The generic fake exits 0 whatever it is handed, which is
-# exactly how the multi-source ditto bug shipped past every assertion in
-# this suite: the fake accepted the invalid call sign.sh made. This one
-# rejects more than one source the same way real ditto does.
+# Each fake appends its own name and arguments to the log so that a test can
+# assert on what the script actually invoked, and honours FAKE_<TOOL>_EXIT
+# and FAKE_<TOOL>_OUT so that a test can force a failure or an output.
+#
+# xcrun has a dedicated fake because notarytool's auth contract is what broke
+# a real release: `notarytool log` was called with --key-id and --issuer but
+# no --key, and every rejection answered with the usage error below instead
+# of Apple's reason for rejecting. A fake that exits 0 for any notarytool
+# invocation cannot see that, which is why this one enforces both halves of
+# the contract: all three API arguments must be present, and --key must name
+# a file that still exists. The second half is what catches deleting the key
+# before the log fetch rather than after it.
+cat > "$FAKEBIN/xcrun" <<'EOF'
+#!/usr/bin/env bash
+echo "xcrun $*" >> "$ARGV_LOG"
+tool="${1:-}"; sub="${2:-}"
+key=""; key_id=""; issuer=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --key) key="${2:-}"; shift ;;
+    --key-id) key_id="${2:-}"; shift ;;
+    --issuer) issuer="${2:-}"; shift ;;
+  esac
+  shift
+done
+if [ "$tool" = notarytool ] && { [ "$sub" = submit ] || [ "$sub" = log ]; }; then
+  if [ -z "$key" ] || [ -z "$key_id" ] || [ -z "$issuer" ]; then
+    echo "Must provide all App Store Connect API arguments for Team Keys (--key, --key-id, --issuer), and Individual Keys (--key, --key-id)." >&2
+    exit 1
+  fi
+  if [ ! -f "$key" ]; then
+    echo "Error: Could not read the private key file at $key" >&2
+    exit 1
+  fi
+fi
+if [ "$tool" = notarytool ] && [ "$sub" = log ]; then
+  printf '%s\n' "${FAKE_NOTARY_LOG_OUT:-{\"issues\": [{\"message\": \"The signature of the binary is invalid.\"}]}}"
+  exit "${FAKE_NOTARY_LOG_EXIT:-0}"
+fi
+[ -n "${FAKE_XCRUN_OUT:-}" ] && printf '%s\n' "$FAKE_XCRUN_OUT"
+exit "${FAKE_XCRUN_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/xcrun"
+
 cat > "$FAKEBIN/ditto" <<EOF
 #!/usr/bin/env bash
 echo "ditto \$*" >> "$ARGV_LOG"
@@ -407,6 +430,52 @@ case "$out" in *Invalid*) ok "the failure reports the status" ;;
                *) fail "status not reported: $out" ;; esac
 grep -q 'notarytool log' "$ARGV_LOG" \
   && ok "a rejection fetches Apple's log" || fail "no log fetch: $(cat "$ARGV_LOG")"
+
+# A rejection's only actionable content is Apple's reason, and fetching it
+# needs all three App Store Connect arguments. The log call used to pass
+# --key-id and --issuer but not --key, so a real .dmg rejection answered
+# "Must provide all App Store Connect API arguments..." instead, and someone
+# had to query Apple's Notary API by hand. The key file was also deleted
+# straight after the submit, so even with --key added the call would have
+# been handed a path to a file that no longer existed. The fake xcrun models
+# both halves of that contract.
+grep -qE '^xcrun notarytool log .*--key .*--key-id .*--issuer ' "$ARGV_LOG" \
+  && ok "the log fetch passes all three API arguments" \
+  || fail "the log call is missing an API argument: $(grep 'notarytool log' "$ARGV_LOG")"
+case "$out" in *"Must provide all App Store Connect API arguments"*)
+                 fail "the log fetch was refused for missing credentials: $out" ;;
+               *) ok "the log fetch is not refused for missing credentials" ;; esac
+case "$out" in *"Could not read the private key file"*)
+                 fail "the key was deleted before the log fetch could use it: $out" ;;
+               *) ok "the key still exists when the log is fetched" ;; esac
+case "$out" in *"The signature of the binary is invalid."*)
+                 ok "Apple's reason for the rejection reaches the operator" ;;
+               *) fail "Apple's reason did not reach the operator: $out" ;; esac
+
+# Fake teeth: the three assertions above are only worth something because
+# the fake really does enforce what the real tool enforces.
+if xcrun notarytool log abc-123 --key-id K --issuer I >/dev/null 2>&1; then
+  fail "the fake xcrun accepted a notarytool log call with no --key"
+else
+  ok "the fake xcrun rejects a notarytool log call missing --key"
+fi
+if xcrun notarytool log abc-123 --key "$TMPD/no-such-key.p8" --key-id K --issuer I >/dev/null 2>&1; then
+  fail "the fake xcrun accepted a notarytool log call whose key file is gone"
+else
+  ok "the fake xcrun rejects a notarytool log call whose key file is gone"
+fi
+
+# The decoded private key must not outlive the process on either path. An
+# EXIT trap removes it, so a normal return, an early exit and an errexit
+# abort are all covered; the rm that used to sit after the submit covered
+# only the first and ran too early for the log fetch.
+P8="$TMPD/notary/key.p8"
+out="$(FAKE_XCRUN_OUT="$invalid" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ ! -e "$P8" ] && ok "the private key does not survive a rejected run" \
+               || fail "the private key was left at $P8 after a rejection"
+out="$(FAKE_XCRUN_OUT="$accepted" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ ! -e "$P8" ] && ok "the private key does not survive an accepted run" \
+               || fail "the private key was left at $P8 after an accepted run"
 
 # notarytool's --output-format json can still land a raw error string on
 # stdout (an auth failure, a network error), which is not JSON at all. This

@@ -171,6 +171,22 @@ except Exception:
     sys.exit(3)' "$field"
 }
 
+# The decoded private key has to outlive the submit, because the log fetch on
+# the rejection path needs it and Apple's reason for a rejection is the only
+# actionable thing a failed run produces. It must not outlive the process,
+# because it is a private key sitting on a runner. An EXIT trap does both, on
+# every path out of cmd_notarize: a normal return, each of the early exits,
+# and an errexit abort anywhere in between. Moving the `rm` to the end of the
+# happy path would cover none of those, and putting it straight after the
+# submit, which is where it used to be, deleted the key before the one call
+# that needed it.
+NOTARY_KEY_FILE=""
+remove_notary_key() {
+  if [ -n "${NOTARY_KEY_FILE:-}" ]; then
+    rm -f "$NOTARY_KEY_FILE"
+  fi
+}
+
 cmd_notarize() {
   [ "$#" -gt 0 ] || { echo "sign.sh: notarize needs at least one file" >&2; exit 2; }
   require_var APPLE_NOTARY_KEY_P8
@@ -180,6 +196,8 @@ cmd_notarize() {
   local work="${RUNNER_TEMP:?RUNNER_TEMP is unset}/notary"
   mkdir -p "$work"
   local p8="$work/key.p8"
+  NOTARY_KEY_FILE="$p8"
+  trap remove_notary_key EXIT
   printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8"
 
   # A .dmg or .app is submitted as itself; bare executables are zipped,
@@ -219,7 +237,6 @@ cmd_notarize() {
             --key "$p8" --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
             --wait --timeout "${NOTARY_TIMEOUT:-1h}" --output-format json)"
-  rm -f "$p8"
   # `|| parse_rc=$?` rather than a bare command substitution: under `set -e`
   # a failing `status="$(...)"` would otherwise abort the script right here,
   # on a raw Python traceback, before the message below or the log fetch
@@ -231,7 +248,8 @@ cmd_notarize() {
     printf '%s\n' "$json" >&2
     local id; id="$(printf '%s' "$json" | json_field id)" || id=""
     if [ -n "$id" ]; then
-      xcrun notarytool log "$id" --key-id "$APPLE_NOTARY_KEY_ID" \
+      xcrun notarytool log "$id" --key "$p8" \
+            --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" >&2 || true
     fi
     exit 1
@@ -242,7 +260,12 @@ cmd_notarize() {
     echo "sign.sh: notarization was not accepted (status: $status)." >&2
     # Apple's reason is the only actionable part and lives behind a second
     # call, so it is fetched here rather than left for someone to run by hand.
-    xcrun notarytool log "$id" --key-id "$APPLE_NOTARY_KEY_ID" \
+    # notarytool needs all three API arguments for a team key. Omitting
+    # --key here made every rejection answer "Must provide all App Store
+    # Connect API arguments" instead of Apple's reason, which is the whole
+    # value of this call.
+    xcrun notarytool log "$id" --key "$p8" \
+          --key-id "$APPLE_NOTARY_KEY_ID" \
           --issuer "$APPLE_NOTARY_ISSUER_ID" >&2 || true
     exit 1
   fi
