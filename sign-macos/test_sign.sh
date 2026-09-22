@@ -60,58 +60,38 @@ exit "\${FAKE_DITTO_EXIT:-0}"
 EOF
 chmod +x "$FAKEBIN/ditto"
 
-# codesign gets a dedicated fake because sign.sh now asks it two different
-# questions and the answers must not be forced together: FAKE_CODESIGN_EXIT is
-# the signature check, FAKE_CODESIGN_NOTARIZED_EXIT is the "=notarized"
-# requirement, and FAKE_NOTARIZED_FAIL_TARGET fails that requirement for one
-# named file only. A single knob for both would let "the signature is invalid" and
-# "Apple has no ticket" masquerade as each other, which is the whole
-# distinction the new assess path is built on.
-#
-# The failure text is modelled deliberately, and is the same string in both
-# of the two situations real codesign cannot tell apart (no ticket, and no
-# route to Apple to look one up). Nothing in sign.sh may key off this text to
-# separate them: the reachability probe is what separates them.
+# codesign gets a dedicated fake rather than the generic "log argv, exit 0"
+# template, so that a test can fail one named file and not the others:
+# FAKE_CODESIGN_EXIT fails every call, FAKE_CODESIGN_FAIL_TARGET fails only
+# the file whose path ends with the value given. A single global knob cannot
+# express "this binary verifies and the next one does not", and a suite that
+# cannot express that cannot tell "every file was assessed" from "the first
+# file was assessed", which is the bug round 5 fixed.
 cat > "$FAKEBIN/codesign" <<'EOF'
 #!/usr/bin/env bash
 echo "codesign $*" >> "$ARGV_LOG"
-req=""; target=""
+target=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --test-requirement=*) req="${1#--test-requirement=}" ;;
-    -R=*)                 req="${1#-R=}" ;;
-    -R)                   req="${2:-}"; shift ;;
     --entitlements|--sign|--identifier|--prefix|--requirements) shift ;;
     -*) : ;;
     *) target="$1" ;;
   esac
   shift
 done
-if [ "$req" = "=notarized" ] || [ "$req" = "notarized" ]; then
-  rc="${FAKE_CODESIGN_NOTARIZED_EXIT:-0}"
-  # Real codesign answers per file: one binary in a set can be notarized and
-  # the next not. A single global knob could not express that, and a suite
-  # that cannot express it cannot tell "every file was assessed" from "the
-  # first file was assessed", which is the bug this models.
-  if [ -n "${FAKE_NOTARIZED_FAIL_TARGET:-}" ]; then
-    case "$target" in
-      *"$FAKE_NOTARIZED_FAIL_TARGET") rc=1 ;;
-      *) rc=0 ;;
-    esac
-  fi
-  if [ "$rc" = 0 ]; then
-    echo "$target: valid on disk"
-    echo "$target: satisfies its Designated Requirement"
-    echo "$target: explicit requirement satisfied"
-  else
-    echo "$target: valid on disk" >&2
-    echo "$target: satisfies its Designated Requirement" >&2
-    echo "test-requirement: code failed to satisfy specified code requirement(s)" >&2
-  fi
+rc="${FAKE_CODESIGN_EXIT:-0}"
+if [ -n "${FAKE_CODESIGN_FAIL_TARGET:-}" ]; then
+  case "$target" in
+    *"$FAKE_CODESIGN_FAIL_TARGET") rc=1 ;;
+    *) rc=0 ;;
+  esac
+fi
+if [ "$rc" != 0 ]; then
+  echo "$target: code object is not signed at all" >&2
   exit "$rc"
 fi
 [ -n "${FAKE_CODESIGN_OUT:-}" ] && printf '%s\n' "$FAKE_CODESIGN_OUT"
-exit "${FAKE_CODESIGN_EXIT:-0}"
+exit 0
 EOF
 chmod +x "$FAKEBIN/codesign"
 
@@ -154,18 +134,6 @@ case "$type" in
 esac
 EOF
 chmod +x "$FAKEBIN/spctl"
-
-# curl stands in for the notarization ticket service reachability probe.
-# sign.sh calls it without --fail, so real curl exits 0 for any HTTP response
-# and nonzero only when it could not reach the host at all (6 could not
-# resolve, 7 could not connect, 28 timed out). FAKE_CURL_EXIT is how a test
-# takes the network away.
-cat > "$FAKEBIN/curl" <<'EOF'
-#!/usr/bin/env bash
-echo "curl $*" >> "$ARGV_LOG"
-exit "${FAKE_CURL_EXIT:-0}"
-EOF
-chmod +x "$FAKEBIN/curl"
 
 export PATH="$FAKEBIN:$PATH"
 
@@ -428,67 +396,39 @@ grep -q 'xcrun stapler validate' "$ARGV_LOG" && ok "staple validates" || fail "n
 # correctly signed, Apple-notarized binary. The fake spctl above now answers
 # exactly that way, so a regression to spctl for this artefact kind fails here
 # rather than on the runner.
+#
+# What replaced it was a signature check plus a codesign "=notarized"
+# requirement test, and the requirement test is gone again: on a real runner
+# it reported no ticket for a binary notarytool had returned Accepted for
+# twenty seconds earlier. There are no assertions here about notarization,
+# deliberately. cmd_notarize is where that is established, and its assertions
+# are in the notarize block above.
 out="$(run_sign assess "$TMPD/ramses")"; rc=$?
-[ "$rc" = 0 ] && ok "assess passes a signed, notarized bare executable" \
+[ "$rc" = 0 ] && ok "assess passes a validly signed bare executable" \
                || fail "assess on a bare executable exited $rc: $out"
 grep -q '^spctl ' "$ARGV_LOG" \
   && fail "assess still asks spctl about a bare executable: $(cat "$ARGV_LOG")" \
   || ok "assess does not ask spctl about a bare executable"
 grep -q -- 'codesign --verify --strict' "$ARGV_LOG" \
   && ok "assess checks the signature itself" || fail "no signature check: $(cat "$ARGV_LOG")"
-grep -q -- '--test-requirement==notarized' "$ARGV_LOG" \
-  && ok "assess tests the =notarized requirement" \
-  || fail "no notarization requirement test: $(cat "$ARGV_LOG")"
-case "$out" in *notarized*) ok "assess reports the binary as notarized" ;;
-               *) fail "assess did not report notarization: $out" ;; esac
+case "$out" in *"signature valid"*) ok "assess reports the signature as valid" ;;
+               *) fail "assess did not report the signature: $out" ;; esac
 
-# The two codesign questions must stay separable: an invalid signature is a
-# signing problem and reads as one, not as a notarization verdict.
 out="$(FAKE_CODESIGN_EXIT=1 run_sign assess "$TMPD/ramses")"; rc=$?
 [ "$rc" = 1 ] && ok "assess fails when the signature is not valid" \
                || fail "assess exited $rc on an invalid signature"
 case "$out" in *"signature on"*"is not valid"*) ok "an invalid signature is named as such" ;;
                *) fail "the signature failure was not named: $out" ;; esac
 
-# The requirement fails and Apple's ticket service is reachable: that is a
-# verdict. The binary is not the one Apple notarized.
-out="$(FAKE_CODESIGN_NOTARIZED_EXIT=1 run_sign assess "$TMPD/ramses")"; rc=$?
-[ "$rc" = 1 ] && ok "assess fails when Apple has no ticket for the binary" \
-               || fail "assess exited $rc with no notarization ticket: $out"
-case "$out" in *"no notarization"*) ok "the missing ticket is named" ;;
-               *) fail "the missing ticket was not named: $out" ;; esac
-case "$out" in *"could not be completed"*) fail "a real verdict was reported as inconclusive: $out" ;;
-               *) ok "a reachable lookup is reported as a verdict, not as inconclusive" ;; esac
-
-# The requirement fails and the ticket service is unreachable: codesign prints
-# the identical message in both cases (the fake models that), so the only
-# thing separating them is the probe. This must not pass, and must not claim
-# the binary is unnotarized either.
-out="$(FAKE_CODESIGN_NOTARIZED_EXIT=1 FAKE_CURL_EXIT=7 run_sign assess "$TMPD/ramses")"; rc=$?
-[ "$rc" = 3 ] && ok "an unreachable ticket service exits 3, not 0 and not 1" \
-               || fail "assess exited $rc when the check could not be completed: $out"
-case "$out" in *"could not be completed"*) ok "the inconclusive check says so" ;;
-               *) fail "the inconclusive check did not say so: $out" ;; esac
-case "$out" in *api.apple-cloudkit.com*) ok "the unreachable host is named" ;;
-               *) fail "the unreachable host was not named: $out" ;; esac
-case "$out" in *"no notarization"*) fail "an unreachable lookup was reported as a missing ticket: $out" ;;
-               *) ok "an unreachable lookup is not reported as a missing ticket" ;; esac
-grep -q '^curl ' "$ARGV_LOG" \
-  && ok "the ticket service is actually probed before classifying the failure" \
-  || fail "no reachability probe: $(cat "$ARGV_LOG")"
-
 # assess: a .dmg keeps its existing treatment. A stapled ticket travels inside
-# it, so spctl answers offline and answers the whole Gatekeeper question.
+# it, so spctl can answer offline and answers the whole Gatekeeper question.
 out="$(run_sign assess "$TMPD/STEPSS.dmg")"; rc=$?
 [ "$rc" = 0 ] && ok "assess passes a stapled .dmg" || fail "assess on a .dmg: $out"
 grep -q -- 'spctl --assess --type install' "$ARGV_LOG" \
   && ok "a .dmg is assessed by spctl as an install" || fail "no install assessment: $(cat "$ARGV_LOG")"
-grep -q -- '--test-requirement' "$ARGV_LOG" \
+grep -q '^codesign ' "$ARGV_LOG" \
   && fail "a .dmg was sent down the bare-executable path: $(cat "$ARGV_LOG")" \
-  || ok "a .dmg does not use the =notarized requirement"
-grep -q '^curl ' "$ARGV_LOG" \
-  && fail "a .dmg probed the ticket service: $(cat "$ARGV_LOG")" \
-  || ok "a .dmg needs no online ticket lookup"
+  || ok "a .dmg is not sent down the bare-executable path"
 
 # assess: every file, not just the first. The action used to close with
 # `assess "${files[0]}"`, so helios's libhelios_api.dylib and ramses's
@@ -496,7 +436,7 @@ grep -q '^curl ' "$ARGV_LOG" \
 # to the second artefact passed the step.
 : > "$ARGV_LOG"
 out="$(run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
-[ "$rc" = 0 ] && ok "assess passes two signed, notarized executables" \
+[ "$rc" = 0 ] && ok "assess passes two validly signed executables" \
                || fail "assess over two files exited $rc: $out"
 [ "$(printf '%s\n' "$out" | grep -c '^Assessing ')" = 2 ] \
   && ok "assess names each file it checks" \
@@ -504,16 +444,13 @@ out="$(run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
 grep -qE '^codesign --verify --strict --verbose=2 .*/ramses\.so$' "$ARGV_LOG" \
   && ok "the second file gets its own signature check" \
   || fail "no signature check for the second file: $(cat "$ARGV_LOG")"
-grep -qE -- '--test-requirement==notarized .*/ramses\.so$' "$ARGV_LOG" \
-  && ok "the second file gets its own notarization check" \
-  || fail "no notarization check for the second file: $(cat "$ARGV_LOG")"
 
 # The second file fails and the first does not. This is the case the old
 # single-file assess could not see at all.
-out="$(FAKE_NOTARIZED_FAIL_TARGET=ramses.so run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
+out="$(FAKE_CODESIGN_FAIL_TARGET=ramses.so run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
 [ "$rc" = 1 ] && ok "a failure on the second file fails the step" \
                || fail "assess exited $rc when the second file failed: $out"
-case "$out" in *"/ramses.so is validly signed, but Apple has no notarization"*)
+case "$out" in *"signature on "*"/ramses.so is not valid"*)
                  ok "the failing file is named, not just any file" ;;
                *) fail "the failing file was not named: $out" ;; esac
 [ "$(printf '%s\n' "$out" | grep -c '^Assessing ')" = 2 ] \
