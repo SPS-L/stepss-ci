@@ -143,6 +143,60 @@ cmd_verify() {
   done
 }
 
+cmd_notarize() {
+  [ "$#" -gt 0 ] || { echo "sign.sh: notarize needs at least one file" >&2; exit 2; }
+  require_var APPLE_NOTARY_KEY_P8
+  require_var APPLE_NOTARY_KEY_ID
+  require_var APPLE_NOTARY_ISSUER_ID
+
+  local work="${RUNNER_TEMP:?RUNNER_TEMP is unset}/notary"
+  mkdir -p "$work"
+  local p8="$work/key.p8"
+  printf '%s' "$APPLE_NOTARY_KEY_P8" | base64 --decode > "$p8"
+
+  # A .dmg or .app is submitted as itself; bare executables are zipped,
+  # because notarytool accepts only .zip, .pkg and .dmg.
+  local payload
+  if [ "$#" -eq 1 ] && case "$1" in *.dmg|*.pkg|*.app) true ;; *) false ;; esac; then
+    payload="$1"
+  else
+    payload="$work/payload.zip"
+    ditto -c -k --keepParent "$@" "$payload"
+  fi
+
+  local json status
+  json="$(xcrun notarytool submit "$payload" \
+            --key "$p8" --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" \
+            --wait --output-format json)"
+  rm -f "$p8"
+  status="$(printf '%s' "$json" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')"
+  echo "notarytool status: $status"
+  if [ "$status" != "Accepted" ]; then
+    local id; id="$(printf '%s' "$json" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')"
+    echo "sign.sh: notarization was not accepted (status: $status)." >&2
+    # Apple's reason is the only actionable part and lives behind a second
+    # call, so it is fetched here rather than left for someone to run by hand.
+    xcrun notarytool log "$id" --key-id "$APPLE_NOTARY_KEY_ID" \
+          --issuer "$APPLE_NOTARY_ISSUER_ID" >&2 || true
+    exit 1
+  fi
+}
+
+cmd_staple() {
+  local bundle="${1:?sign.sh staple needs a .dmg, .pkg or .app}"
+  xcrun stapler staple "$bundle"
+  xcrun stapler validate "$bundle"
+}
+
+cmd_assess() {
+  local target="${1:?sign.sh assess needs a path}"
+  case "$target" in
+    *.dmg|*.pkg) spctl --assess --type install --verbose=4 "$target" ;;
+    *)           spctl --assess --type execute --verbose=4 "$target" ;;
+  esac
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || { usage; exit 2; }
@@ -155,6 +209,9 @@ main() {
     identity)       cmd_identity "$@" ;;
     sign)   cmd_sign "$@" ;;
     verify) cmd_verify "$@" ;;
+    notarize) cmd_notarize "$@" ;;
+    staple)   cmd_staple "$@" ;;
+    assess)   cmd_assess "$@" ;;
     *) echo "sign.sh: unknown command: $cmd" >&2; usage; exit 2 ;;
   esac
 }

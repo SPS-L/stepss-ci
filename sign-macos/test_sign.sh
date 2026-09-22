@@ -162,6 +162,37 @@ out="$(run_sign verify "$TMPD/ramses")"; rc=$?
 grep -q -- '--verify --strict' "$ARGV_LOG" \
   && ok "verify is strict" || fail "verify not strict: $(cat "$ARGV_LOG")"
 
+# ---- notarize ------------------------------------------------------------
+accepted='{"id":"abc-123","status":"Accepted"}'
+out="$(FAKE_XCRUN_OUT="$accepted" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ "$rc" = 0 ] && ok "notarize succeeds on Accepted" || fail "notarize: $out"
+grep -q 'xcrun notarytool submit' "$ARGV_LOG" \
+  && ok "notarize submits" || fail "no submit: $(cat "$ARGV_LOG")"
+grep -q -- '--wait' "$ARGV_LOG" \
+  && ok "notarize waits for the verdict" || fail "no --wait"
+grep -q '69a6de82-68c9-47e3-e053-5b8c7c11a4d1' "$ARGV_LOG" \
+  && ok "notarize passes the issuer id" || fail "no issuer id: $(cat "$ARGV_LOG")"
+grep -q 'ditto ' "$ARGV_LOG" \
+  && ok "notarize builds a zip with ditto" || fail "no ditto call"
+
+invalid='{"id":"abc-123","status":"Invalid"}'
+out="$(FAKE_XCRUN_OUT="$invalid" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ "$rc" = 1 ] && ok "notarize fails on Invalid" || fail "notarize exited $rc on Invalid"
+case "$out" in *Invalid*) ok "the failure reports the status" ;;
+               *) fail "status not reported: $out" ;; esac
+grep -q 'notarytool log' "$ARGV_LOG" \
+  && ok "a rejection fetches Apple's log" || fail "no log fetch: $(cat "$ARGV_LOG")"
+
+# ---- staple and assess ---------------------------------------------------
+out="$(run_sign staple "$TMPD/STEPSS.dmg")"; rc=$?
+[ "$rc" = 0 ] && ok "staple succeeds" || fail "staple: $out"
+grep -q 'xcrun stapler staple' "$ARGV_LOG" && ok "staple staples" || fail "no staple call"
+grep -q 'xcrun stapler validate' "$ARGV_LOG" && ok "staple validates" || fail "no validate call"
+
+out="$(run_sign assess "$TMPD/ramses")"; rc=$?
+[ "$rc" = 0 ] && ok "assess succeeds" || fail "assess: $out"
+grep -q '^spctl ' "$ARGV_LOG" && ok "assess calls spctl" || fail "no spctl call"
+
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
 echo "$FAILURES test(s) failed"; exit 1
