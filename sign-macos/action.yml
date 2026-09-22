@@ -70,8 +70,20 @@ runs:
         while IFS= read -r f; do
           files+=("$f")
         done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
-        bash "${{ github.action_path }}/sign.sh" sign "${files[@]}"
-        bash "${{ github.action_path }}/sign.sh" verify "${files[@]}"
+        # A whitespace-only paths input passes this step's own `if:` guard
+        # above but leaves $files empty. "${files[@]}" on a zero-element
+        # array raises "unbound variable" under bash 3.2's `set -u` (fixed in
+        # bash 4.4, which the runner's stock /bin/bash does not have), so the
+        # count is checked before ever expanding the array: the empty branch
+        # calls sign.sh with no file arguments, and sign.sh's own
+        # `[ "$#" -gt 0 ]` check is what reports the empty input, not a
+        # shell abort.
+        if [ "${#files[@]}" -eq 0 ]; then
+          bash "${{ github.action_path }}/sign.sh" sign
+        else
+          bash "${{ github.action_path }}/sign.sh" sign "${files[@]}"
+          bash "${{ github.action_path }}/sign.sh" verify "${files[@]}"
+        fi
 
     - name: Notarize
       if: inputs.mode != 'sign'
@@ -83,13 +95,24 @@ runs:
           bash "${{ github.action_path }}/sign.sh" staple "${{ inputs.bundle }}"
           bash "${{ github.action_path }}/sign.sh" assess "${{ inputs.bundle }}"
         else
-          # Same bash-3.2 constraint as the Sign step above.
+          # Same bash-3.2 constraints as the Sign step above: build the
+          # array with a read loop rather than mapfile, and check its count
+          # before expanding it. mode: notarize with both bundle and paths
+          # left at their empty defaults reaches this branch with zero
+          # elements; the empty branch below calls sign.sh with no file
+          # arguments so that sign.sh's own message reports it, rather than
+          # the shell aborting on "${files[@]}" (or "${files[0]}" for the
+          # assess call) unbound under set -u.
           files=()
           while IFS= read -r f; do
             files+=("$f")
           done < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
-          bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
-          bash "${{ github.action_path }}/sign.sh" assess "${files[0]}"
+          if [ "${#files[@]}" -eq 0 ]; then
+            bash "${{ github.action_path }}/sign.sh" notarize
+          else
+            bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
+            bash "${{ github.action_path }}/sign.sh" assess "${files[0]}"
+          fi
         fi
 
     - name: Close the keychain

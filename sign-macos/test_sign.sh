@@ -200,6 +200,46 @@ case "$out" in *Invalid*) ok "the failure reports the status" ;;
 grep -q 'notarytool log' "$ARGV_LOG" \
   && ok "a rejection fetches Apple's log" || fail "no log fetch: $(cat "$ARGV_LOG")"
 
+# notarytool's --output-format json can still land a raw error string on
+# stdout (an auth failure, a network error), which is not JSON at all. This
+# used to raise an unhandled JSONDecodeError inside json_field; under `set
+# -e` the enclosing `status="$(...)"` assignment then aborted sign.sh on a
+# Python traceback, before the "not accepted" message printed and before the
+# log fetch ever ran (see the fix-round report for the before/after
+# transcripts).
+badjson='error: could not connect to notarization service'
+out="$(FAKE_XCRUN_OUT="$badjson" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ "$rc" != 0 ] && ok "notarize fails on unparseable notarytool output" \
+               || fail "notarize exited 0 on unparseable output"
+case "$out" in *"could not parse notarytool's output as JSON"*) ok "the failure is named, not a raw traceback" ;;
+               *) fail "no named failure: $out" ;; esac
+case "$out" in *"$badjson"*) ok "the received (non-JSON) text is echoed" ;;
+               *) fail "received text not echoed: $out" ;; esac
+case "$out" in *Traceback*) fail "a Python traceback leaked to the caller: $out" ;;
+               *) ok "no raw Python traceback leaks to the caller" ;; esac
+
+# ---- empty file list (the action.yml side of the same fix round) ---------
+# action.yml now checks ${#files[@]} before ever expanding "${files[@]}" (or
+# indexing "${files[0]}"), so an empty paths input calls sign.sh with zero
+# file arguments instead of letting the shell expand an empty array — which
+# raises "unbound variable" under bash 3.2's `set -u` (fixed in bash 4.4;
+# the macOS runner's stock /bin/bash predates that fix and this sandbox's
+# bash postdates it, so the crash itself cannot be reproduced here — see the
+# fix-round report). This pins the sign.sh side of that fix: the contract
+# action.yml's empty branch relies on is that sign.sh's own message, not a
+# shell error, is what a caller sees.
+out="$(run_sign sign)"; rc=$?
+[ "$rc" = 2 ] && ok "sign with zero files exits 2" || fail "sign with zero files exited $rc"
+case "$out" in *"sign needs at least one file"*) ok "sign's own message reports the empty input" ;;
+               *) fail "sign did not name the empty input: $out" ;; esac
+case "$out" in *"unbound variable"*|*"bad substitution"*) fail "a shell error leaked instead of sign.sh's message: $out" ;;
+               *) ok "no shell-level error text leaks from a zero-argument sign" ;; esac
+
+out="$(run_sign notarize)"; rc=$?
+[ "$rc" = 2 ] && ok "notarize with zero files exits 2" || fail "notarize with zero files exited $rc"
+case "$out" in *"notarize needs at least one file"*) ok "notarize's own message reports the empty input" ;;
+               *) fail "notarize did not name the empty input: $out" ;; esac
+
 # ---- staple and assess ---------------------------------------------------
 out="$(run_sign staple "$TMPD/STEPSS.dmg")"; rc=$?
 [ "$rc" = 0 ] && ok "staple succeeds" || fail "staple: $out"

@@ -148,11 +148,20 @@ cmd_verify() {
 # and across multiple lines. A sed/substring match tuned to compact JSON
 # silently returns empty against that shape, so this parses for real.
 # python3 ships on every macOS runner.
+#
+# Exits 3 (rather than letting an unhandled JSONDecodeError abort the whole
+# script under `set -e`) when stdin is not the JSON object notarytool
+# promises, e.g. an error string it printed to stdout instead. The caller
+# must check for that exit code rather than trust an empty result: an empty
+# string is also what a present-but-unparseable field would look like.
 json_field() {
   local field="$1"
   python3 -c 'import json, sys
-d = json.load(sys.stdin)
-print(d.get(sys.argv[1], ""))' "$field"
+try:
+    d = json.load(sys.stdin)
+    print(d.get(sys.argv[1], ""))
+except Exception:
+    sys.exit(3)' "$field"
 }
 
 cmd_notarize() {
@@ -176,13 +185,28 @@ cmd_notarize() {
     ditto -c -k --keepParent "$@" "$payload"
   fi
 
-  local json status
+  local json status parse_rc=0
   json="$(xcrun notarytool submit "$payload" \
             --key "$p8" --key-id "$APPLE_NOTARY_KEY_ID" \
             --issuer "$APPLE_NOTARY_ISSUER_ID" \
             --wait --output-format json)"
   rm -f "$p8"
-  status="$(printf '%s' "$json" | json_field status)"
+  # `|| parse_rc=$?` rather than a bare command substitution: under `set -e`
+  # a failing `status="$(...)"` would otherwise abort the script right here,
+  # on a raw Python traceback, before the message below or the log fetch
+  # ever run.
+  status="$(printf '%s' "$json" | json_field status)" || parse_rc=$?
+  if [ "$parse_rc" -ne 0 ]; then
+    echo "sign.sh: could not parse notarytool's output as JSON." >&2
+    echo "notarytool said:" >&2
+    printf '%s\n' "$json" >&2
+    local id; id="$(printf '%s' "$json" | json_field id)" || id=""
+    if [ -n "$id" ]; then
+      xcrun notarytool log "$id" --key-id "$APPLE_NOTARY_KEY_ID" \
+            --issuer "$APPLE_NOTARY_ISSUER_ID" >&2 || true
+    fi
+    exit 1
+  fi
   echo "notarytool status: $status"
   if [ "$status" != "Accepted" ]; then
     local id; id="$(printf '%s' "$json" | json_field id)"
