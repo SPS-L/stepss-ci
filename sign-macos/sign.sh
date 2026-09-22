@@ -181,8 +181,26 @@ cmd_notarize() {
   if [ "$#" -eq 1 ] && case "$1" in *.dmg|*.pkg|*.app) true ;; *) false ;; esac; then
     payload="$1"
   else
+    # ditto's archive mode (-c) accepts exactly one source, so every input
+    # file is staged flat into one directory first and that single directory
+    # is what gets archived. --keepParent is deliberately not used: it would
+    # wrap the contents in an entry named for the staging directory under
+    # $RUNNER_TEMP, and Apple issues a notarization ticket per Mach-O found
+    # in the archive, so a flat layout of the binaries is what is wanted.
+    local stage="$work/payload"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    local f base
+    for f in "$@"; do
+      base="$(basename "$f")"
+      if [ -e "$stage/$base" ]; then
+        echo "sign.sh: notarize: two inputs are both named $base; the archive would lose one." >&2
+        exit 1
+      fi
+      cp "$f" "$stage/$base"
+    done
     payload="$work/payload.zip"
-    ditto -c -k --keepParent "$@" "$payload"
+    ditto -c -k "$stage" "$payload"
   fi
 
   local json status parse_rc=0

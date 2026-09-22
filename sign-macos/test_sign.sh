@@ -17,7 +17,7 @@ ARGV_LOG="$TMPD/argv.log"
 # One fake per Apple tool. Each appends its own name and arguments to the log
 # so that a test can assert on what the script actually invoked, and honours
 # FAKE_<TOOL>_EXIT so that a test can force a failure.
-for tool in security codesign xcrun ditto spctl; do
+for tool in security codesign xcrun spctl; do
   cat > "$FAKEBIN/$tool" <<EOF
 #!/usr/bin/env bash
 echo "$tool \$*" >> "$ARGV_LOG"
@@ -28,6 +28,37 @@ exit "\${!var:-0}"
 EOF
   chmod +x "$FAKEBIN/$tool"
 done
+
+# ditto gets a dedicated fake rather than the generic template above: it is
+# the one tool sign.sh calls in a mode (-c, archive creation) where the real
+# tool enforces a contract on argument count ("ditto: Can't archive multiple
+# sources"). The generic fake exits 0 whatever it is handed, which is
+# exactly how the multi-source ditto bug shipped past every assertion in
+# this suite: the fake accepted the invalid call sign.sh made. This one
+# rejects more than one source the same way real ditto does.
+cat > "$FAKEBIN/ditto" <<EOF
+#!/usr/bin/env bash
+echo "ditto \$*" >> "$ARGV_LOG"
+create=false
+args=()
+for a in "\$@"; do
+  case "\$a" in
+    -c) create=true ;;
+    -k|-V|--keepParent|--norsrc|--rsrc|--sequesterRsrc) : ;;
+    -*) : ;;
+    *) args+=("\$a") ;;
+  esac
+done
+if \$create && [ "\${#args[@]}" -gt 2 ]; then
+  echo "ditto: Can't archive multiple sources" >&2
+  echo "Usage: ditto [ <options> ] src [ ... src ] dst" >&2
+  exit 1
+fi
+[ -n "\${FAKE_DITTO_OUT:-}" ] && printf '%s\n' "\$FAKE_DITTO_OUT"
+exit "\${FAKE_DITTO_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/ditto"
+
 export PATH="$FAKEBIN:$PATH"
 
 run_sign() { : > "$ARGV_LOG"; bash "$SCRIPT" "$@" 2>&1; }
@@ -182,6 +213,41 @@ grep -q '69a6de82-68c9-47e3-e053-5b8c7c11a4d1' "$ARGV_LOG" \
   && ok "notarize passes the issuer id" || fail "no issuer id: $(cat "$ARGV_LOG")"
 grep -q 'ditto ' "$ARGV_LOG" \
   && ok "notarize builds a zip with ditto" || fail "no ditto call"
+
+# ---- notarize: archiving one file and more than one -----------------------
+# ditto's archive mode (-c) accepts exactly one source. Before this fix,
+# `ditto -c -k --keepParent "$@" "$payload"` handed it every input file plus
+# the destination, which is invalid the moment there is more than one file.
+# This is exactly the failure stepss-helios hit on its first real run
+# (`ditto: Can't archive multiple sources`), and the old fake ditto accepted
+# the invalid call anyway (see the fix-round report for the red-then-green
+# transcript proving that against the pre-fix code).
+rm -rf "$TMPD/notary"
+out="$(FAKE_XCRUN_OUT="$accepted" run_sign notarize "$TMPD/ramses")"; rc=$?
+[ "$rc" = 0 ] && ok "notarize archives a single file" || fail "single-file notarize: $out"
+# Anchored so this matches only "ditto -c -k <one arg> <one arg>" exactly:
+# an extra --keepParent token, or a third path before the destination, fails
+# the match just as it would fail real ditto's argument count.
+grep -qE '^ditto -c -k [^ ]+ [^ ]+$' "$ARGV_LOG" \
+  && ok "ditto is given exactly one source (the staging directory)" \
+  || fail "ditto call: $(cat "$ARGV_LOG")"
+[ -e "$TMPD/notary/payload/ramses" ] \
+  && ok "the single file is staged for archiving" \
+  || fail "not staged: $(ls "$TMPD/notary/payload" 2>&1)"
+
+rm -rf "$TMPD/notary"
+out="$(FAKE_XCRUN_OUT="$accepted" run_sign notarize "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
+[ "$rc" = 0 ] && ok "notarize archives two files" || fail "two-file notarize: $out"
+grep -qE '^ditto -c -k [^ ]+ [^ ]+$' "$ARGV_LOG" \
+  && ok "ditto is still given exactly one source with two inputs" \
+  || fail "ditto call: $(cat "$ARGV_LOG")"
+[ -e "$TMPD/notary/payload/ramses" ] && [ -e "$TMPD/notary/payload/ramses.so" ] \
+  && ok "both input files are present in the staged archive directory" \
+  || fail "staged files: $(ls "$TMPD/notary/payload" 2>&1)"
+staged_count="$(find "$TMPD/notary/payload" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')"
+[ "$staged_count" = 2 ] \
+  && ok "the staged layout is flat, not nested under a runner-specific path" \
+  || fail "staged directory has $staged_count top-level entries"
 
 # Compact JSON never comes from notarytool itself, but the parser must not
 # be tied to either shape.
