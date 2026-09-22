@@ -17,7 +17,8 @@ ARGV_LOG="$TMPD/argv.log"
 # One fake per Apple tool. Each appends its own name and arguments to the log
 # so that a test can assert on what the script actually invoked, and honours
 # FAKE_<TOOL>_EXIT so that a test can force a failure.
-for tool in security codesign xcrun spctl; do
+export ARGV_LOG
+for tool in security xcrun; do
   cat > "$FAKEBIN/$tool" <<EOF
 #!/usr/bin/env bash
 echo "$tool \$*" >> "$ARGV_LOG"
@@ -58,6 +59,102 @@ fi
 exit "\${FAKE_DITTO_EXIT:-0}"
 EOF
 chmod +x "$FAKEBIN/ditto"
+
+# codesign gets a dedicated fake because sign.sh now asks it two different
+# questions and the answers must not be forced together: FAKE_CODESIGN_EXIT is
+# the signature check, FAKE_CODESIGN_NOTARIZED_EXIT is the "=notarized"
+# requirement. A single knob for both would let "the signature is invalid" and
+# "Apple has no ticket" masquerade as each other, which is the whole
+# distinction the new assess path is built on.
+#
+# The failure text is modelled deliberately, and is the same string in both
+# of the two situations real codesign cannot tell apart (no ticket, and no
+# route to Apple to look one up). Nothing in sign.sh may key off this text to
+# separate them: the reachability probe is what separates them.
+cat > "$FAKEBIN/codesign" <<'EOF'
+#!/usr/bin/env bash
+echo "codesign $*" >> "$ARGV_LOG"
+req=""; target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --test-requirement=*) req="${1#--test-requirement=}" ;;
+    -R=*)                 req="${1#-R=}" ;;
+    -R)                   req="${2:-}"; shift ;;
+    --entitlements|--sign|--identifier|--prefix|--requirements) shift ;;
+    -*) : ;;
+    *) target="$1" ;;
+  esac
+  shift
+done
+if [ "$req" = "=notarized" ] || [ "$req" = "notarized" ]; then
+  rc="${FAKE_CODESIGN_NOTARIZED_EXIT:-0}"
+  if [ "$rc" = 0 ]; then
+    echo "$target: valid on disk"
+    echo "$target: satisfies its Designated Requirement"
+    echo "$target: explicit requirement satisfied"
+  else
+    echo "$target: valid on disk" >&2
+    echo "$target: satisfies its Designated Requirement" >&2
+    echo "test-requirement: code failed to satisfy specified code requirement(s)" >&2
+  fi
+  exit "$rc"
+fi
+[ -n "${FAKE_CODESIGN_OUT:-}" ] && printf '%s\n' "$FAKE_CODESIGN_OUT"
+exit "${FAKE_CODESIGN_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/codesign"
+
+# spctl gets a dedicated fake for the same reason ditto did: the generic one
+# exited 0 whatever it was handed, so `spctl --assess --type execute` on a
+# bare command-line executable passed every assertion in this suite while
+# failing on the runner. Real spctl assesses application bundles and declines
+# anything else with the message below and exit 3. Note that it says the
+# code is valid, because it is; spctl is refusing the question, not the
+# binary.
+cat > "$FAKEBIN/spctl" <<'EOF'
+#!/usr/bin/env bash
+echo "spctl $*" >> "$ARGV_LOG"
+type=""; target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --type) type="${2:-}"; shift ;;
+    --type=*) type="${1#--type=}" ;;
+    -*) : ;;
+    *) target="$1" ;;
+  esac
+  shift
+done
+[ -n "${FAKE_SPCTL_OUT:-}" ] && printf '%s\n' "$FAKE_SPCTL_OUT"
+[ -n "${FAKE_SPCTL_EXIT:-}" ] && exit "$FAKE_SPCTL_EXIT"
+accept() { echo "$target: accepted"; echo "source=Notarized Developer ID"; exit 0; }
+case "$type" in
+  execute)
+    case "$target" in
+      *.app|*.app/) accept ;;
+      *) echo "$target: rejected (the code is valid but does not seem to be an app)" >&2
+         exit 3 ;;
+    esac ;;
+  install)
+    case "$target" in
+      *.dmg|*.pkg) accept ;;
+      *) echo "$target: rejected" >&2; exit 3 ;;
+    esac ;;
+  *) echo "$target: rejected" >&2; exit 3 ;;
+esac
+EOF
+chmod +x "$FAKEBIN/spctl"
+
+# curl stands in for the notarization ticket service reachability probe.
+# sign.sh calls it without --fail, so real curl exits 0 for any HTTP response
+# and nonzero only when it could not reach the host at all (6 could not
+# resolve, 7 could not connect, 28 timed out). FAKE_CURL_EXIT is how a test
+# takes the network away.
+cat > "$FAKEBIN/curl" <<'EOF'
+#!/usr/bin/env bash
+echo "curl $*" >> "$ARGV_LOG"
+exit "${FAKE_CURL_EXIT:-0}"
+EOF
+chmod +x "$FAKEBIN/curl"
 
 export PATH="$FAKEBIN:$PATH"
 
@@ -312,9 +409,83 @@ out="$(run_sign staple "$TMPD/STEPSS.dmg")"; rc=$?
 grep -q 'xcrun stapler staple' "$ARGV_LOG" && ok "staple staples" || fail "no staple call"
 grep -q 'xcrun stapler validate' "$ARGV_LOG" && ok "staple validates" || fail "no validate call"
 
+# assess: a bare executable. `spctl --assess --type execute` used to be asked
+# here and answered "rejected (the code is valid but does not seem to be an
+# app)" with exit 3, because a plain Mach-O tool is not an application bundle
+# and spctl assesses application bundles. helios, ramses, CODEGEN and dyngraph
+# all ship bare executables, so that was four of the five callers failing on a
+# correctly signed, Apple-notarized binary. The fake spctl above now answers
+# exactly that way, so a regression to spctl for this artefact kind fails here
+# rather than on the runner.
 out="$(run_sign assess "$TMPD/ramses")"; rc=$?
-[ "$rc" = 0 ] && ok "assess succeeds" || fail "assess: $out"
-grep -q '^spctl ' "$ARGV_LOG" && ok "assess calls spctl" || fail "no spctl call"
+[ "$rc" = 0 ] && ok "assess passes a signed, notarized bare executable" \
+               || fail "assess on a bare executable exited $rc: $out"
+grep -q '^spctl ' "$ARGV_LOG" \
+  && fail "assess still asks spctl about a bare executable: $(cat "$ARGV_LOG")" \
+  || ok "assess does not ask spctl about a bare executable"
+grep -q -- 'codesign --verify --strict' "$ARGV_LOG" \
+  && ok "assess checks the signature itself" || fail "no signature check: $(cat "$ARGV_LOG")"
+grep -q -- '--test-requirement==notarized' "$ARGV_LOG" \
+  && ok "assess tests the =notarized requirement" \
+  || fail "no notarization requirement test: $(cat "$ARGV_LOG")"
+case "$out" in *notarized*) ok "assess reports the binary as notarized" ;;
+               *) fail "assess did not report notarization: $out" ;; esac
+
+# The two codesign questions must stay separable: an invalid signature is a
+# signing problem and reads as one, not as a notarization verdict.
+out="$(FAKE_CODESIGN_EXIT=1 run_sign assess "$TMPD/ramses")"; rc=$?
+[ "$rc" = 1 ] && ok "assess fails when the signature is not valid" \
+               || fail "assess exited $rc on an invalid signature"
+case "$out" in *"signature on"*"is not valid"*) ok "an invalid signature is named as such" ;;
+               *) fail "the signature failure was not named: $out" ;; esac
+
+# The requirement fails and Apple's ticket service is reachable: that is a
+# verdict. The binary is not the one Apple notarized.
+out="$(FAKE_CODESIGN_NOTARIZED_EXIT=1 run_sign assess "$TMPD/ramses")"; rc=$?
+[ "$rc" = 1 ] && ok "assess fails when Apple has no ticket for the binary" \
+               || fail "assess exited $rc with no notarization ticket: $out"
+case "$out" in *"no notarization"*) ok "the missing ticket is named" ;;
+               *) fail "the missing ticket was not named: $out" ;; esac
+case "$out" in *"could not be completed"*) fail "a real verdict was reported as inconclusive: $out" ;;
+               *) ok "a reachable lookup is reported as a verdict, not as inconclusive" ;; esac
+
+# The requirement fails and the ticket service is unreachable: codesign prints
+# the identical message in both cases (the fake models that), so the only
+# thing separating them is the probe. This must not pass, and must not claim
+# the binary is unnotarized either.
+out="$(FAKE_CODESIGN_NOTARIZED_EXIT=1 FAKE_CURL_EXIT=7 run_sign assess "$TMPD/ramses")"; rc=$?
+[ "$rc" = 3 ] && ok "an unreachable ticket service exits 3, not 0 and not 1" \
+               || fail "assess exited $rc when the check could not be completed: $out"
+case "$out" in *"could not be completed"*) ok "the inconclusive check says so" ;;
+               *) fail "the inconclusive check did not say so: $out" ;; esac
+case "$out" in *api.apple-cloudkit.com*) ok "the unreachable host is named" ;;
+               *) fail "the unreachable host was not named: $out" ;; esac
+case "$out" in *"no notarization"*) fail "an unreachable lookup was reported as a missing ticket: $out" ;;
+               *) ok "an unreachable lookup is not reported as a missing ticket" ;; esac
+grep -q '^curl ' "$ARGV_LOG" \
+  && ok "the ticket service is actually probed before classifying the failure" \
+  || fail "no reachability probe: $(cat "$ARGV_LOG")"
+
+# assess: a .dmg keeps its existing treatment. A stapled ticket travels inside
+# it, so spctl answers offline and answers the whole Gatekeeper question.
+out="$(run_sign assess "$TMPD/STEPSS.dmg")"; rc=$?
+[ "$rc" = 0 ] && ok "assess passes a stapled .dmg" || fail "assess on a .dmg: $out"
+grep -q -- 'spctl --assess --type install' "$ARGV_LOG" \
+  && ok "a .dmg is assessed by spctl as an install" || fail "no install assessment: $(cat "$ARGV_LOG")"
+grep -q -- '--test-requirement' "$ARGV_LOG" \
+  && fail "a .dmg was sent down the bare-executable path: $(cat "$ARGV_LOG")" \
+  || ok "a .dmg does not use the =notarized requirement"
+grep -q '^curl ' "$ARGV_LOG" \
+  && fail "a .dmg probed the ticket service: $(cat "$ARGV_LOG")" \
+  || ok "a .dmg needs no online ticket lookup"
+
+# An .app is an application bundle, which is the one thing
+# `spctl --assess --type execute` is for.
+out="$(run_sign assess "$TMPD/STEPSS.app")"; rc=$?
+[ "$rc" = 0 ] && ok "assess passes an .app" || fail "assess on an .app: $out"
+grep -q -- 'spctl --assess --type execute' "$ARGV_LOG" \
+  && ok "an .app is assessed by spctl as executable code" \
+  || fail "no execute assessment for an .app: $(cat "$ARGV_LOG")"
 
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }

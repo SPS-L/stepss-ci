@@ -19,7 +19,8 @@ usage: sign.sh <command> [args]
   verify <file>...          codesign --verify --strict
   notarize <file>...        submit to notarytool and wait for Accepted
   staple <bundle>           staple a ticket to a .dmg or .app and validate it
-  assess <file>             spctl assessment
+  assess <file>             final check: spctl for a bundle, codesign
+                            --test-requirement="=notarized" for a bare executable
 EOF
 }
 
@@ -243,11 +244,93 @@ cmd_staple() {
   xcrun stapler validate "$bundle"
 }
 
+# Apple's notarization ticket lookup. Both Gatekeeper and codesign's
+# "=notarized" requirement resolve a ticket that is not stapled to the code by
+# reading this CloudKit database, so a bare executable's notarization can only
+# be confirmed with the network up.
+#
+# The question asked here is whether the host was reachable, not whether the
+# lookup would have returned anything, so --fail is deliberately absent: any
+# HTTP response at all (this URL answers a POST, so a GET is an error status)
+# means the lookup could have been made, while a DNS, TLS, connection or
+# timeout failure is curl's own nonzero exit.
+NOTARY_TICKET_HOST="api.apple-cloudkit.com"
+NOTARY_TICKET_URL="https://$NOTARY_TICKET_HOST/database/1/com.apple.gk.ticket-delivery/production/public/records/lookup"
+
+ticket_service_reachable() {
+  curl --silent --output /dev/null \
+       --max-time "${ASSESS_PROBE_TIMEOUT:-10}" "$NOTARY_TICKET_URL"
+}
+
+# A plain Mach-O executable is not an application bundle, and spctl assesses
+# application bundles. `spctl --assess --type execute` on one answers
+#
+#   build/helios: rejected (the code is valid but does not seem to be an app)
+#
+# with exit 3. It is declining to assess, not reporting a signing problem,
+# and it says so in the same breath ("the code is valid"). Four of the five
+# repositories that call this action ship bare executables, so that reading
+# failed every one of them on a step meant to confirm the work.
+#
+# What is worth establishing for a bare executable is the two things spctl
+# would have established for a bundle: the signature is valid, and the binary
+# Apple notarized is this binary. They are asked separately, and on purpose.
+#
+#   1. codesign --verify --strict      the signature, offline and unambiguous.
+#   2. --test-requirement="=notarized" the ticket, which for code that cannot
+#                                      carry a stapled one is fetched online.
+#
+# Step 2 is the documented route for unstaplable code, and it has one property
+# that has to be handled rather than discovered later: when it fails, it prints
+# "code failed to satisfy specified code requirement(s)" whether Apple has no
+# ticket for this binary or the lookup never reached Apple. Those are a verdict
+# and the absence of one, and the text does not tell them apart. So a failure
+# is classified by asking whether the ticket service was reachable at all, and
+# the inconclusive case exits 3 under its own message instead of being reported
+# as a notarization failure. Neither branch exits 0: a check that could not run
+# must not read as a check that passed.
+assess_executable() {
+  local target="$1" out rc=0
+  if ! out="$(codesign --verify --strict --verbose=2 "$target" 2>&1)"; then
+    echo "sign.sh: the signature on $target is not valid." >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+  printf '%s\n' "$out"
+
+  out="$(codesign --verify --strict --verbose=2 \
+                  --test-requirement="=notarized" "$target" 2>&1)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    printf '%s\n' "$out"
+    echo "$target: signed and notarized."
+    return 0
+  fi
+
+  if ticket_service_reachable; then
+    echo "sign.sh: $target is validly signed, but Apple has no notarization" >&2
+    echo "ticket for it. The binary that was notarized is not this binary," >&2
+    echo "or it was modified after notarization." >&2
+    printf '%s\n' "$out" >&2
+    exit 1
+  fi
+
+  echo "sign.sh: the notarization check could not be completed." >&2
+  echo "The signature on $target is valid, but confirming its notarization" >&2
+  echo "needs $NOTARY_TICKET_HOST, which this runner could not reach. That is" >&2
+  echo "not a verdict either way, so this step fails rather than passing on a" >&2
+  echo "check that never ran." >&2
+  printf '%s\n' "$out" >&2
+  exit 3
+}
+
 cmd_assess() {
   local target="${1:?sign.sh assess needs a path}"
   case "$target" in
+    # A stapled ticket travels inside these, so spctl can answer offline and
+    # answers the whole Gatekeeper question, which is the better one to ask.
     *.dmg|*.pkg) spctl --assess --type install --verbose=4 "$target" ;;
-    *)           spctl --assess --type execute --verbose=4 "$target" ;;
+    *.app)       spctl --assess --type execute --verbose=4 "$target" ;;
+    *)           assess_executable "$target" ;;
   esac
 }
 
