@@ -101,8 +101,7 @@ runs:
           # left at their empty defaults reaches this branch with zero
           # elements; the empty branch below calls sign.sh with no file
           # arguments so that sign.sh's own message reports it, rather than
-          # the shell aborting on "${files[@]}" (or "${files[0]}" for the
-          # assess call) unbound under set -u.
+          # the shell aborting on "${files[@]}" unbound under set -u.
           files=()
           while IFS= read -r f; do
             files+=("$f")
@@ -111,7 +110,12 @@ runs:
             bash "${{ github.action_path }}/sign.sh" notarize
           else
             bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
-            bash "${{ github.action_path }}/sign.sh" assess "${files[0]}"
+            # Every file, not just the first. This used to pass
+            # "${files[0]}", which left helios's libhelios_api.dylib and
+            # ramses's ramses.so unassessed. sign.sh assess takes a list and
+            # loops inside, so the shell here expands the array once, under
+            # the same count guard, and no loop of its own is needed.
+            bash "${{ github.action_path }}/sign.sh" assess "${files[@]}"
           fi
         fi
 

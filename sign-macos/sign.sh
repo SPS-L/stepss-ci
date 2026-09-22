@@ -19,7 +19,7 @@ usage: sign.sh <command> [args]
   verify <file>...          codesign --verify --strict
   notarize <file>...        submit to notarytool and wait for Accepted
   staple <bundle>           staple a ticket to a .dmg or .app and validate it
-  assess <file>             final check: spctl for a bundle, codesign
+  assess <file>...          final check: spctl for a bundle, codesign
                             --test-requirement="=notarized" for a bare executable
 EOF
 }
@@ -296,12 +296,12 @@ assess_executable() {
     printf '%s\n' "$out" >&2
     exit 1
   fi
-  printf '%s\n' "$out"
+  if [ -n "$out" ]; then printf '%s\n' "$out"; fi
 
   out="$(codesign --verify --strict --verbose=2 \
                   --test-requirement="=notarized" "$target" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ]; then
-    printf '%s\n' "$out"
+    if [ -n "$out" ]; then printf '%s\n' "$out"; fi
     echo "$target: signed and notarized."
     return 0
   fi
@@ -323,8 +323,8 @@ assess_executable() {
   exit 3
 }
 
-cmd_assess() {
-  local target="${1:?sign.sh assess needs a path}"
+assess_one() {
+  local target="$1"
   case "$target" in
     # A stapled ticket travels inside these, so spctl can answer offline and
     # answers the whole Gatekeeper question, which is the better one to ask.
@@ -332,6 +332,27 @@ cmd_assess() {
     *.app)       spctl --assess --type execute --verbose=4 "$target" ;;
     *)           assess_executable "$target" ;;
   esac
+}
+
+# Takes a list, like sign, verify and notarize do, rather than leaving the
+# caller to loop. Every file that was signed and submitted gets the closing
+# check: helios ships `helios` and `libhelios_api.dylib`, ramses ships
+# `ramses` and `ramses.so`, and assessing only the first exempted half the
+# artefacts of both from the one step that confirms the work.
+#
+# The file is named before it is checked, so a run log reads as a list of
+# what was assessed and stops at the file that failed rather than leaving
+# someone to work out which of them the message was about. Like cmd_sign and
+# cmd_verify, this stops at the first failure: the artefacts of one build are
+# not independent the way the release workflow's platform legs are, and the
+# first failure already blocks the release.
+cmd_assess() {
+  [ "$#" -gt 0 ] || { echo "sign.sh: assess needs at least one file" >&2; exit 2; }
+  local target
+  for target in "$@"; do
+    echo "Assessing $target"
+    assess_one "$target"
+  done
 }
 
 main() {

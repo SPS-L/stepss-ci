@@ -63,7 +63,8 @@ chmod +x "$FAKEBIN/ditto"
 # codesign gets a dedicated fake because sign.sh now asks it two different
 # questions and the answers must not be forced together: FAKE_CODESIGN_EXIT is
 # the signature check, FAKE_CODESIGN_NOTARIZED_EXIT is the "=notarized"
-# requirement. A single knob for both would let "the signature is invalid" and
+# requirement, and FAKE_NOTARIZED_FAIL_TARGET fails that requirement for one
+# named file only. A single knob for both would let "the signature is invalid" and
 # "Apple has no ticket" masquerade as each other, which is the whole
 # distinction the new assess path is built on.
 #
@@ -88,6 +89,16 @@ while [ $# -gt 0 ]; do
 done
 if [ "$req" = "=notarized" ] || [ "$req" = "notarized" ]; then
   rc="${FAKE_CODESIGN_NOTARIZED_EXIT:-0}"
+  # Real codesign answers per file: one binary in a set can be notarized and
+  # the next not. A single global knob could not express that, and a suite
+  # that cannot express it cannot tell "every file was assessed" from "the
+  # first file was assessed", which is the bug this models.
+  if [ -n "${FAKE_NOTARIZED_FAIL_TARGET:-}" ]; then
+    case "$target" in
+      *"$FAKE_NOTARIZED_FAIL_TARGET") rc=1 ;;
+      *) rc=0 ;;
+    esac
+  fi
   if [ "$rc" = 0 ]; then
     echo "$target: valid on disk"
     echo "$target: satisfies its Designated Requirement"
@@ -478,6 +489,46 @@ grep -q -- '--test-requirement' "$ARGV_LOG" \
 grep -q '^curl ' "$ARGV_LOG" \
   && fail "a .dmg probed the ticket service: $(cat "$ARGV_LOG")" \
   || ok "a .dmg needs no online ticket lookup"
+
+# assess: every file, not just the first. The action used to close with
+# `assess "${files[0]}"`, so helios's libhelios_api.dylib and ramses's
+# ramses.so were signed and notarized but never checked. A problem confined
+# to the second artefact passed the step.
+: > "$ARGV_LOG"
+out="$(run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
+[ "$rc" = 0 ] && ok "assess passes two signed, notarized executables" \
+               || fail "assess over two files exited $rc: $out"
+[ "$(printf '%s\n' "$out" | grep -c '^Assessing ')" = 2 ] \
+  && ok "assess names each file it checks" \
+  || fail "assess named $(printf '%s\n' "$out" | grep -c '^Assessing ') files, expected 2: $out"
+grep -qE '^codesign --verify --strict --verbose=2 .*/ramses\.so$' "$ARGV_LOG" \
+  && ok "the second file gets its own signature check" \
+  || fail "no signature check for the second file: $(cat "$ARGV_LOG")"
+grep -qE -- '--test-requirement==notarized .*/ramses\.so$' "$ARGV_LOG" \
+  && ok "the second file gets its own notarization check" \
+  || fail "no notarization check for the second file: $(cat "$ARGV_LOG")"
+
+# The second file fails and the first does not. This is the case the old
+# single-file assess could not see at all.
+out="$(FAKE_NOTARIZED_FAIL_TARGET=ramses.so run_sign assess "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
+[ "$rc" = 1 ] && ok "a failure on the second file fails the step" \
+               || fail "assess exited $rc when the second file failed: $out"
+case "$out" in *"/ramses.so is validly signed, but Apple has no notarization"*)
+                 ok "the failing file is named, not just any file" ;;
+               *) fail "the failing file was not named: $out" ;; esac
+[ "$(printf '%s\n' "$out" | grep -c '^Assessing ')" = 2 ] \
+  && ok "the run reached the second file before failing" \
+  || fail "assess did not reach the second file: $out"
+
+# The same zero-argument contract sign and notarize already keep, so that
+# action.yml's count guard has something to hand an empty list to.
+out="$(run_sign assess)"; rc=$?
+[ "$rc" = 2 ] && ok "assess with zero files exits 2" || fail "assess with zero files exited $rc: $out"
+case "$out" in *"assess needs at least one file"*) ok "assess's own message reports the empty input" ;;
+               *) fail "assess did not name the empty input: $out" ;; esac
+case "$out" in *"unbound variable"*|*"bad substitution"*|*"parameter null"*)
+                 fail "a shell error leaked instead of sign.sh's message: $out" ;;
+               *) ok "no shell-level error text leaks from a zero-argument assess" ;; esac
 
 # An .app is an application bundle, which is the one thing
 # `spctl --assess --type execute` is for.
