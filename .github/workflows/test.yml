@@ -1,0 +1,16 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shell syntax
+        run: bash -n sign-macos/sign.sh sign-macos/test_sign.sh
+      - name: Unit tests
+        run: bash sign-macos/test_sign.sh
