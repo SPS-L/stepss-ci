@@ -119,6 +119,32 @@ out="$(run_sign keychain-close)"; rc=$?
 grep -q 'security delete-keychain' "$ARGV_LOG" \
   && ok "keychain-close deletes the keychain" || fail "no delete in: $(cat "$ARGV_LOG")"
 
+# ---- sign and verify -----------------------------------------------------
+: > "$TMPD/ramses"; : > "$TMPD/ramses.so"
+out="$(FAKE_SECURITY_OUT="$one_identity" run_sign sign "$TMPD/ramses" "$TMPD/ramses.so")"; rc=$?
+[ "$rc" = 0 ] && ok "sign succeeds over two files" || fail "sign: $out"
+[ "$(grep -c '^codesign ' "$ARGV_LOG")" = 2 ] \
+  && ok "sign invokes codesign once per file" || fail "codesign calls: $(grep -c '^codesign ' "$ARGV_LOG")"
+grep -q -- '--options runtime' "$ARGV_LOG" \
+  && ok "sign enables the hardened runtime" || fail "no --options runtime: $(cat "$ARGV_LOG")"
+grep -q -- '--timestamp' "$ARGV_LOG" \
+  && ok "sign requests a secure timestamp" || fail "no --timestamp"
+grep -q -- '--entitlements' "$ARGV_LOG" \
+  && ok "sign passes entitlements" || fail "no --entitlements"
+grep -q 'A1B2C3D4E5F60718293A4B5C6D7E8F9012345678' "$ARGV_LOG" \
+  && ok "sign uses the resolved hash" || fail "hash not used: $(cat "$ARGV_LOG")"
+
+out="$(FAKE_SECURITY_OUT="$one_identity" FAKE_CODESIGN_EXIT=1 run_sign sign "$TMPD/ramses")"; rc=$?
+[ "$rc" != 0 ] && ok "a codesign failure fails the step" || fail "sign swallowed a codesign failure"
+
+out="$(run_sign sign "$TMPD/does-not-exist")"; rc=$?
+[ "$rc" = 1 ] && ok "sign fails on a missing file" || fail "sign exited $rc on a missing file"
+
+out="$(run_sign verify "$TMPD/ramses")"; rc=$?
+[ "$rc" = 0 ] && ok "verify succeeds" || fail "verify: $out"
+grep -q -- '--verify --strict' "$ARGV_LOG" \
+  && ok "verify is strict" || fail "verify not strict: $(cat "$ARGV_LOG")"
+
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
 echo "$FAILURES test(s) failed"; exit 1

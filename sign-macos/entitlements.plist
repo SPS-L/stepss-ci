@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- The engines link against Homebrew's gfortran, OpenMP and OpenBLAS
+       runtimes, which carry ad-hoc signatures. Library validation, which the
+       hardened runtime enables by default and which notarization makes
+       mandatory, refuses to load a dylib signed by another team. Without this
+       key the binaries pass Gatekeeper and then fail to start. -->
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>

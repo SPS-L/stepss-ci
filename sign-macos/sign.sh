@@ -115,6 +115,31 @@ cmd_identity() {
   printf '%s\n' "$hash"
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cmd_sign() {
+  [ "$#" -gt 0 ] || { echo "sign.sh: sign needs at least one file" >&2; exit 2; }
+  local ents="${SIGN_ENTITLEMENTS:-$SCRIPT_DIR/entitlements.plist}"
+  local hash; hash="$(cmd_identity)"
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] || { echo "sign.sh: no such file: $f" >&2; exit 1; }
+  done
+  for f in "$@"; do
+    echo "Signing $f"
+    codesign --force --timestamp --options runtime \
+             --entitlements "$ents" --sign "$hash" "$f"
+  done
+}
+
+cmd_verify() {
+  [ "$#" -gt 0 ] || { echo "sign.sh: verify needs at least one file" >&2; exit 2; }
+  local f
+  for f in "$@"; do
+    codesign --verify --strict --verbose=2 "$f"
+  done
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || { usage; exit 2; }
@@ -125,6 +150,8 @@ main() {
     keychain-open)  cmd_keychain_open "$@" ;;
     keychain-close) cmd_keychain_close "$@" ;;
     identity)       cmd_identity "$@" ;;
+    sign)   cmd_sign "$@" ;;
+    verify) cmd_verify "$@" ;;
     *) echo "sign.sh: unknown command: $cmd" >&2; usage; exit 2 ;;
   esac
 }
