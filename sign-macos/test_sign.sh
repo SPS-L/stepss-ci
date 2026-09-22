@@ -80,6 +80,45 @@ out="$(run_sign cert-expiry "$soon")"; rc=$?
 case "$out" in *90\ days*|*89\ days*|*91\ days*) ok "the warning counts the days" ;;
                *) fail "no day count in the warning: $out" ;; esac
 
+# ---- identity ------------------------------------------------------------
+# RUNNER_TEMP must be exported before these: cmd_identity resolves the
+# keychain path the same way keychain-open/keychain-close do, so it needs
+# RUNNER_TEMP set even though it does not touch the keychain lifecycle.
+export RUNNER_TEMP="$TMPD"
+one_identity='  1) A1B2C3D4E5F60718293A4B5C6D7E8F9012345678 "Developer ID Application: Cyprus University of Technology (SWZD63F3C7)"
+     1 valid identities found'
+out="$(FAKE_SECURITY_OUT="$one_identity" run_sign identity)"; rc=$?
+[ "$rc" = 0 ] && ok "identity succeeds with exactly one" \
+               || fail "identity exited $rc with one identity: $out"
+[ "$out" = "A1B2C3D4E5F60718293A4B5C6D7E8F9012345678" ] \
+  && ok "identity prints the bare hash" || fail "identity printed: $out"
+
+none='     0 valid identities found'
+out="$(FAKE_SECURITY_OUT="$none" run_sign identity)"; rc=$?
+[ "$rc" = 1 ] && ok "identity fails when the keychain holds none" \
+               || fail "identity exited $rc with no identity"
+
+two="$one_identity
+  2) FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF \"Developer ID Application: Other (XXXX)\""
+out="$(FAKE_SECURITY_OUT="$two" run_sign identity)"; rc=$?
+[ "$rc" = 1 ] && ok "identity fails when the keychain holds two" \
+               || fail "identity exited $rc with two identities"
+
+# ---- keychain lifecycle --------------------------------------------------
+out="$(run_sign keychain-open)"; rc=$?
+[ "$rc" = 0 ] && ok "keychain-open succeeds" || fail "keychain-open: $out"
+grep -q 'security create-keychain' "$ARGV_LOG" \
+  && ok "keychain-open creates a keychain" || fail "no create-keychain in: $(cat "$ARGV_LOG")"
+grep -q 'security import' "$ARGV_LOG" \
+  && ok "keychain-open imports the identity" || fail "no import in: $(cat "$ARGV_LOG")"
+grep -q 'security set-key-partition-list' "$ARGV_LOG" \
+  && ok "keychain-open sets the partition list" || fail "no partition list in: $(cat "$ARGV_LOG")"
+
+out="$(run_sign keychain-close)"; rc=$?
+[ "$rc" = 0 ] && ok "keychain-close succeeds" || fail "keychain-close: $out"
+grep -q 'security delete-keychain' "$ARGV_LOG" \
+  && ok "keychain-close deletes the keychain" || fail "no delete in: $(cat "$ARGV_LOG")"
+
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
 echo "$FAILURES test(s) failed"; exit 1

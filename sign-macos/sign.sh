@@ -72,6 +72,49 @@ cmd_cert_expiry() {
   echo "Certificate valid for $days more days."
 }
 
+keychain_path() { echo "${RUNNER_TEMP:?RUNNER_TEMP is unset}/stepss-signing.keychain-db"; }
+
+cmd_keychain_open() {
+  require_var APPLE_SIGNING_P12
+  require_var APPLE_SIGNING_P12_PASSWORD
+  local kc; kc="$(keychain_path)"
+  local kcpass; kcpass="$(openssl rand -base64 24)"
+  local p12="${RUNNER_TEMP}/identity.p12"
+
+  printf '%s' "$APPLE_SIGNING_P12" | base64 --decode > "$p12"
+  security create-keychain -p "$kcpass" "$kc"
+  security set-keychain-settings -lut 21600 "$kc"
+  security unlock-keychain -p "$kcpass" "$kc"
+  # -A is deliberately not used: the partition list below grants access to
+  # codesign alone rather than to every application on the runner.
+  security import "$p12" -k "$kc" -P "$APPLE_SIGNING_P12_PASSWORD" \
+           -T /usr/bin/codesign -T /usr/bin/productsign
+  security set-key-partition-list -S apple-tool:,apple:,codesign: \
+           -s -k "$kcpass" "$kc"
+  security list-keychains -d user -s "$kc" "$(security list-keychains -d user | tr -d ' "')"
+  rm -f "$p12"
+  echo "Keychain ready at $kc"
+}
+
+cmd_keychain_close() {
+  local kc; kc="$(keychain_path)"
+  security delete-keychain "$kc" || true
+  echo "Keychain removed."
+}
+
+cmd_identity() {
+  local listing count hash
+  listing="$(security find-identity -v -p codesigning "$(keychain_path)")"
+  count="$(printf '%s\n' "$listing" | grep -c -E '^[[:space:]]*[0-9]+\) [0-9A-F]{40} ' || true)"
+  if [ "$count" -ne 1 ]; then
+    echo "sign.sh: expected exactly one code signing identity, found $count." >&2
+    printf '%s\n' "$listing" >&2
+    exit 1
+  fi
+  hash="$(printf '%s\n' "$listing" | grep -o -E '[0-9A-F]{40}' | head -n1)"
+  printf '%s\n' "$hash"
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || { usage; exit 2; }
@@ -79,6 +122,9 @@ main() {
   case "$cmd" in
     preflight) cmd_preflight "$@" ;;
     cert-expiry) cmd_cert_expiry "$@" ;;
+    keychain-open)  cmd_keychain_open "$@" ;;
+    keychain-close) cmd_keychain_close "$@" ;;
+    identity)       cmd_identity "$@" ;;
     *) echo "sign.sh: unknown command: $cmd" >&2; usage; exit 2 ;;
   esac
 }
