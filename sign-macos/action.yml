@@ -1,0 +1,87 @@
+name: Sign and notarize macOS binaries
+description: >
+  Signs Mach-O files with the Cyprus University of Technology Developer ID
+  certificate and submits them to Apple's notary service.
+
+inputs:
+  mode:
+    description: "sign, notarize, or sign-and-notarize"
+    required: false
+    default: sign-and-notarize
+  paths:
+    description: "Newline-separated Mach-O files. Empty leaves signing to the caller."
+    required: false
+    default: ""
+  bundle:
+    description: "A .dmg, .pkg or .app to staple after notarization."
+    required: false
+    default: ""
+  entitlements:
+    description: "Override the entitlements plist."
+    required: false
+    default: ""
+
+outputs:
+  keychain-path:
+    description: "The temporary keychain, for tools that must be told where to look."
+    value: ${{ steps.open.outputs.keychain }}
+  identity:
+    description: "SHA-1 of the resolved signing identity."
+    value: ${{ steps.open.outputs.identity }}
+
+runs:
+  using: composite
+  steps:
+    - name: Preflight
+      shell: bash
+      env:
+        SIGN_NOTARIZE: ${{ inputs.mode == 'sign' && 'false' || 'true' }}
+      run: bash "${{ github.action_path }}/sign.sh" preflight
+
+    - name: Open the keychain
+      id: open
+      shell: bash
+      run: |
+        set -euo pipefail
+        bash "${{ github.action_path }}/sign.sh" keychain-open
+        identity="$(bash "${{ github.action_path }}/sign.sh" identity)"
+        echo "identity=$identity" >> "$GITHUB_OUTPUT"
+        echo "keychain=$RUNNER_TEMP/stepss-signing.keychain-db" >> "$GITHUB_OUTPUT"
+        # The certificate is read back from the keychain rather than from the
+        # PKCS#12, because the bundle's certificate bag is RC2-encrypted and
+        # the macOS openssl is LibreSSL.
+        not_after="$(security find-certificate -p -c "Developer ID Application" \
+                     "$RUNNER_TEMP/stepss-signing.keychain-db" \
+                     | openssl x509 -noout -enddate | cut -d= -f2)"
+        bash "${{ github.action_path }}/sign.sh" cert-expiry "$not_after"
+
+    - name: Sign
+      if: inputs.paths != '' && inputs.mode != 'notarize'
+      shell: bash
+      env:
+        SIGN_ENTITLEMENTS: ${{ inputs.entitlements }}
+      run: |
+        set -euo pipefail
+        mapfile -t files < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+        bash "${{ github.action_path }}/sign.sh" sign "${files[@]}"
+        bash "${{ github.action_path }}/sign.sh" verify "${files[@]}"
+
+    - name: Notarize
+      if: inputs.mode != 'sign'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "${{ inputs.bundle }}" ]; then
+          bash "${{ github.action_path }}/sign.sh" notarize "${{ inputs.bundle }}"
+          bash "${{ github.action_path }}/sign.sh" staple "${{ inputs.bundle }}"
+          bash "${{ github.action_path }}/sign.sh" assess "${{ inputs.bundle }}"
+        else
+          mapfile -t files < <(printf '%s\n' "${{ inputs.paths }}" | sed '/^[[:space:]]*$/d')
+          bash "${{ github.action_path }}/sign.sh" notarize "${files[@]}"
+          bash "${{ github.action_path }}/sign.sh" assess "${files[0]}"
+        fi
+
+    - name: Close the keychain
+      if: always()
+      shell: bash
+      run: bash "${{ github.action_path }}/sign.sh" keychain-close
