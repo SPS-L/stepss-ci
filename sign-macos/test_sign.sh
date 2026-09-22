@@ -114,6 +114,23 @@ grep -q 'security import' "$ARGV_LOG" \
 grep -q 'security set-key-partition-list' "$ARGV_LOG" \
   && ok "keychain-open sets the partition list" || fail "no partition list in: $(cat "$ARGV_LOG")"
 
+# Regression test: the final `security list-keychains -s ...` line used to
+# quote the inner command substitution, collapsing N pre-existing keychains
+# into one argv item joined by embedded newlines instead of N separate path
+# arguments. A single pre-existing keychain hid this (there was nothing to
+# join), so this test stages two.
+two_keychains='    "/Users/runner/Library/Keychains/login.keychain-db"
+    "/Users/runner/Library/Keychains/other.keychain-db"'
+out="$(FAKE_SECURITY_OUT="$two_keychains" run_sign keychain-open)"; rc=$?
+[ "$rc" = 0 ] && ok "keychain-open succeeds with two pre-existing keychains" \
+               || fail "keychain-open with two pre-existing keychains: $out"
+grep -q 'security list-keychains -d user -s .*login.keychain-db .*other.keychain-db' "$ARGV_LOG" \
+  && ok "keychain-open passes pre-existing keychains as separate arguments" \
+  || fail "pre-existing keychains not passed as separate arguments: $(cat "$ARGV_LOG")"
+grep -qx '/Users/runner/Library/Keychains/other.keychain-db' "$ARGV_LOG" \
+  && fail "a keychain path leaked onto its own line (embedded newline): $(cat "$ARGV_LOG")" \
+  || ok "no keychain path is split across an embedded newline"
+
 out="$(run_sign keychain-close)"; rc=$?
 [ "$rc" = 0 ] && ok "keychain-close succeeds" || fail "keychain-close: $out"
 grep -q 'security delete-keychain' "$ARGV_LOG" \

@@ -91,7 +91,10 @@ cmd_keychain_open() {
            -T /usr/bin/codesign -T /usr/bin/productsign
   security set-key-partition-list -S apple-tool:,apple:,codesign: \
            -s -k "$kcpass" "$kc"
-  security list-keychains -d user -s "$kc" "$(security list-keychains -d user | tr -d ' "')"
+  # Unquoted deliberately: word splitting turns each pre-existing keychain
+  # path into its own argv item. Quoting this would collapse N keychains into
+  # one argument joined by embedded newlines instead of N separate paths.
+  security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d ' "')
   rm -f "$p12"
   echo "Keychain ready at $kc"
 }
