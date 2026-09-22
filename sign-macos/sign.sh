@@ -329,14 +329,63 @@ assess_executable() {
   echo "$target: signature valid."
 }
 
+# A disk image is checked by validating the ticket stapled to it, and not
+# with spctl. That is not the obvious choice, so here is the reasoning.
+#
+# spctl --assess takes a --type, and the type says what kind of thing is
+# being opened, not what kind of file it is:
+#
+#   --type execute   an application bundle the user is launching.
+#   --type install   an installer package, which is what a .pkg is.
+#   --type open      a document being opened by an application, which is the
+#                    context a downloaded disk image is mounted in.
+#
+# STEPSS 3.82 was Accepted by Apple, stapled, and validated, and then failed
+# on this step with
+#
+#   bundle/STEPSS-3.82.dmg: rejected
+#   source=no usable signature
+#
+# because it was being assessed as --type install, which a disk image is not.
+# The obvious repair is --type open with --context context:primary-signature,
+# the documented question for a notarized disk image, and it would have
+# failed in exactly the same way and for a different reason than the type:
+# jpackage signs the .app it builds and the runtime it assembles, but leaves
+# the disk image itself unsigned, and spctl reports "no usable signature" for
+# an unsigned container under any type. The identical case, down to the
+# message, is written up in dtubb/fichero#4704, where
+# `spctl -a -t open --context context:primary-signature` rejected a .dmg that
+# `xcrun stapler validate` passed, with the container unsigned.
+#
+# So the ticket is what is checked. `xcrun stapler validate` establishes that
+# a valid notarization ticket is attached to this image, which is what lets
+# it open on a machine that has never been online, and it is the only
+# question about a .dmg that can be answered here and answered truthfully.
+#
+# The real gap this leaves is the unsigned container, and it is not fixable
+# from inside this function: the image has to be signed before it is
+# notarized, which is the caller's business. That is reported rather than
+# papered over. Do not restore an spctl call here without first arranging
+# for the .dmg to be signed; it is the third assessment in this file to ask
+# the wrong tool the wrong question, after --type execute on bare
+# executables and the "=notarized" requirement on unstapled code.
+assess_disk_image() {
+  local target="$1"
+  xcrun stapler validate "$target"
+  echo "$target: notarization ticket stapled and valid."
+}
+
 assess_one() {
   local target="$1"
   case "$target" in
-    # A stapled ticket travels inside these, so spctl can answer offline and
-    # answers the whole Gatekeeper question, which is the better one to ask.
-    *.dmg|*.pkg) spctl --assess --type install --verbose=4 "$target" ;;
-    *.app)       spctl --assess --type execute --verbose=4 "$target" ;;
-    *)           assess_executable "$target" ;;
+    *.dmg)  assess_disk_image "$target" ;;
+    # An installer package is what --type install is for, and a .pkg carries
+    # its own signature rather than being a container for one.
+    *.pkg)  spctl --assess --type install --verbose=4 "$target" ;;
+    # An application bundle is what --type execute is for, and a stapled
+    # ticket travels inside it, so spctl can answer offline.
+    *.app)  spctl --assess --type execute --verbose=4 "$target" ;;
+    *)      assess_executable "$target" ;;
   esac
 }
 

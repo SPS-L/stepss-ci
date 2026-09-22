@@ -170,17 +170,34 @@ done
 [ -n "${FAKE_SPCTL_OUT:-}" ] && printf '%s\n' "$FAKE_SPCTL_OUT"
 [ -n "${FAKE_SPCTL_EXIT:-}" ] && exit "$FAKE_SPCTL_EXIT"
 accept() { echo "$target: accepted"; echo "source=Notarized Developer ID"; exit 0; }
+# jpackage signs the .app it builds but leaves the disk image itself
+# unsigned, and spctl reports "no usable signature" for an unsigned
+# container under any --type. That is what STEPSS 3.82 hit, and it is why
+# a .dmg is rejected here whatever type it is assessed as: routing one to
+# spctl fails the suite instead of failing a release.
+unsigned_container() {
+  echo "$target: rejected" >&2
+  echo "source=no usable signature" >&2
+  exit 3
+}
 case "$type" in
   execute)
     case "$target" in
+      *.dmg) unsigned_container ;;
       *.app|*.app/) accept ;;
       *) echo "$target: rejected (the code is valid but does not seem to be an app)" >&2
          exit 3 ;;
     esac ;;
   install)
     case "$target" in
-      *.dmg|*.pkg) accept ;;
+      *.dmg) unsigned_container ;;
+      *.pkg) accept ;;
       *) echo "$target: rejected" >&2; exit 3 ;;
+    esac ;;
+  open)
+    case "$target" in
+      *.dmg) unsigned_container ;;
+      *) accept ;;
     esac ;;
   *) echo "$target: rejected" >&2; exit 3 ;;
 esac
@@ -555,15 +572,52 @@ out="$(FAKE_CODESIGN_EXIT=1 run_sign assess "$TMPD/ramses")"; rc=$?
 case "$out" in *"signature on"*"is not valid"*) ok "an invalid signature is named as such" ;;
                *) fail "the signature failure was not named: $out" ;; esac
 
-# assess: a .dmg keeps its existing treatment. A stapled ticket travels inside
-# it, so spctl can answer offline and answers the whole Gatekeeper question.
+# assess: a .dmg is checked by validating its stapled ticket, not with
+# spctl. STEPSS 3.82 was Accepted, stapled and validated, and then failed
+# here on `spctl --assess --type install` with "rejected / source=no usable
+# signature", discarding the release along with the .deb and .msi that had
+# built correctly. --type install is for installer packages; but --type open
+# with context:primary-signature, the documented question for a notarized
+# disk image, would have been rejected the same way, because jpackage leaves
+# the image itself unsigned and spctl finds no signature on the container
+# under any type. The fake spctl above rejects a .dmg accordingly, so
+# sending one to spctl fails here rather than on a release.
 out="$(run_sign assess "$TMPD/STEPSS.dmg")"; rc=$?
 [ "$rc" = 0 ] && ok "assess passes a stapled .dmg" || fail "assess on a .dmg: $out"
-grep -q -- 'spctl --assess --type install' "$ARGV_LOG" \
-  && ok "a .dmg is assessed by spctl as an install" || fail "no install assessment: $(cat "$ARGV_LOG")"
+grep -q '^spctl ' "$ARGV_LOG" \
+  && fail "a .dmg was sent to spctl: $(cat "$ARGV_LOG")" \
+  || ok "a .dmg is not assessed with spctl"
+grep -q 'stapler validate' "$ARGV_LOG" \
+  && ok "a .dmg is checked by validating its stapled ticket" \
+  || fail "the .dmg's ticket was not validated: $(cat "$ARGV_LOG")"
+case "$out" in *"ticket stapled and valid"*) ok "the .dmg result names what was established" ;;
+               *) fail "the .dmg result says nothing useful: $out" ;; esac
 grep -q '^codesign ' "$ARGV_LOG" \
   && fail "a .dmg was sent down the bare-executable path: $(cat "$ARGV_LOG")" \
   || ok "a .dmg is not sent down the bare-executable path"
+
+# Fake teeth, and the evidence for the routing above. The real spctl
+# rejected this disk image under --type install; it would also have rejected
+# it under --type open, which is why that was not the fix.
+if spctl --assess --type install --verbose=4 "$TMPD/STEPSS.dmg" >/dev/null 2>&1; then
+  fail "the fake spctl accepted an unsigned .dmg container under --type install"
+else
+  ok "the fake spctl rejects an unsigned .dmg container under --type install"
+fi
+if spctl --assess --type open --context context:primary-signature "$TMPD/STEPSS.dmg" >/dev/null 2>&1; then
+  fail "the fake spctl accepted an unsigned .dmg container under --type open"
+else
+  ok "the fake spctl rejects an unsigned .dmg container under --type open too"
+fi
+
+# A .pkg is an installer package and carries its own signature, so
+# --type install is the right question for it and stays.
+: > "$ARGV_LOG"
+out="$(run_sign assess "$TMPD/STEPSS.pkg")"; rc=$?
+[ "$rc" = 0 ] && ok "assess passes a .pkg" || fail "assess on a .pkg: $out"
+grep -q -- 'spctl --assess --type install' "$ARGV_LOG" \
+  && ok "a .pkg is still assessed by spctl as an install" \
+  || fail "no install assessment for the .pkg: $(cat "$ARGV_LOG")"
 
 # assess: every file, not just the first. The action used to close with
 # `assess "${files[0]}"`, so helios's libhelios_api.dylib and ramses's
