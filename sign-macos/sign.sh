@@ -23,11 +23,33 @@ usage: sign.sh <command> [args]
 EOF
 }
 
+require_var() {
+  local name="$1"
+  if [ -z "${!name:-}" ]; then
+    echo "sign.sh: $name is empty." >&2
+    echo "Signing cannot proceed. This step does not skip, because a skipped" >&2
+    echo "signing step publishes unsigned binaries under a green run." >&2
+    exit 1
+  fi
+}
+
+cmd_preflight() {
+  require_var APPLE_SIGNING_P12
+  require_var APPLE_SIGNING_P12_PASSWORD
+  if [ "${SIGN_NOTARIZE:-true}" != "false" ]; then
+    require_var APPLE_NOTARY_KEY_P8
+    require_var APPLE_NOTARY_KEY_ID
+    require_var APPLE_NOTARY_ISSUER_ID
+  fi
+  echo "Credentials present."
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || { usage; exit 2; }
   shift
   case "$cmd" in
+    preflight) cmd_preflight "$@" ;;
     *) echo "sign.sh: unknown command: $cmd" >&2; usage; exit 2 ;;
   esac
 }

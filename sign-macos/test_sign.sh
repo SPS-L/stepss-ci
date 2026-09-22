@@ -38,6 +38,29 @@ out="$(run_sign no-such-command)"; rc=$?
 case "$out" in *no-such-command*) ok "unknown command is named in the error" ;;
                *) fail "error did not name the command: $out" ;; esac
 
+# ---- preflight -----------------------------------------------------------
+export APPLE_SIGNING_P12="Zm9v" APPLE_SIGNING_P12_PASSWORD="pw" \
+       APPLE_NOTARY_KEY_P8="YmFy" APPLE_NOTARY_KEY_ID="8A4L5VF84Z" \
+       APPLE_NOTARY_ISSUER_ID="69a6de82-68c9-47e3-e053-5b8c7c11a4d1"
+
+out="$(run_sign preflight)"; rc=$?
+[ "$rc" = 0 ] && ok "preflight passes with every credential set" \
+               || fail "preflight failed with a full environment: $out"
+
+out="$(APPLE_SIGNING_P12= run_sign preflight)"; rc=$?
+[ "$rc" = 1 ] && ok "preflight fails without the certificate" \
+               || fail "preflight exited $rc without the certificate, expected 1"
+case "$out" in *APPLE_SIGNING_P12*) ok "preflight names the missing variable" ;;
+               *) fail "preflight did not name APPLE_SIGNING_P12: $out" ;; esac
+
+out="$(APPLE_NOTARY_ISSUER_ID= run_sign preflight)"; rc=$?
+[ "$rc" = 1 ] && ok "preflight fails without the issuer id" \
+               || fail "preflight exited $rc without the issuer id, expected 1"
+
+out="$(APPLE_NOTARY_ISSUER_ID= SIGN_NOTARIZE=false run_sign preflight)"; rc=$?
+[ "$rc" = 0 ] && ok "preflight ignores notary credentials when not notarizing" \
+               || fail "preflight exited $rc in sign-only mode: $out"
+
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
 echo "$FAILURES test(s) failed"; exit 1
