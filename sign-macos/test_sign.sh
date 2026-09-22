@@ -61,6 +61,25 @@ out="$(APPLE_NOTARY_ISSUER_ID= SIGN_NOTARIZE=false run_sign preflight)"; rc=$?
 [ "$rc" = 0 ] && ok "preflight ignores notary credentials when not notarizing" \
                || fail "preflight exited $rc in sign-only mode: $out"
 
+# ---- cert-expiry ---------------------------------------------------------
+out="$(run_sign cert-expiry "Sep 12 06:46:04 2031 GMT")"; rc=$?
+[ "$rc" = 0 ] && ok "a certificate valid for years passes" \
+               || fail "cert-expiry rejected a 2031 date: $out"
+
+out="$(run_sign cert-expiry "Jan 01 00:00:00 2020 GMT")"; rc=$?
+[ "$rc" = 1 ] && ok "an expired certificate fails" \
+               || fail "cert-expiry exited $rc on a 2020 date, expected 1"
+case "$out" in *expired*) ok "the failure says expired" ;;
+               *) fail "the failure did not say expired: $out" ;; esac
+
+soon="$(date -u -d '+90 days' '+%b %d %H:%M:%S %Y GMT' 2>/dev/null \
+        || date -u -v+90d '+%b %d %H:%M:%S %Y GMT')"
+out="$(run_sign cert-expiry "$soon")"; rc=$?
+[ "$rc" = 0 ] && ok "a certificate expiring in 90 days still passes" \
+               || fail "cert-expiry exited $rc on a near date: $out"
+case "$out" in *90\ days*|*89\ days*|*91\ days*) ok "the warning counts the days" ;;
+               *) fail "no day count in the warning: $out" ;; esac
+
 echo
 [ "$FAILURES" = 0 ] && { echo "all tests passed"; exit 0; }
 echo "$FAILURES test(s) failed"; exit 1

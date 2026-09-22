@@ -44,12 +44,41 @@ cmd_preflight() {
   echo "Credentials present."
 }
 
+# GNU date on the Linux test runner, BSD date on the macOS runner. The format
+# is OpenSSL's notAfter, e.g. "Sep 12 06:46:04 2031 GMT".
+days_until() {
+  local when="$1" target now
+  if date --version >/dev/null 2>&1; then
+    target="$(date -u -d "$when" +%s)"
+  else
+    target="$(date -u -j -f "%b %d %T %Y %Z" "$when" +%s)"
+  fi
+  now="$(date -u +%s)"
+  echo $(( (target - now) / 86400 ))
+}
+
+cmd_cert_expiry() {
+  local when="${1:?sign.sh cert-expiry needs a notAfter string}"
+  local days; days="$(days_until "$when")"
+  if [ "$days" -lt 0 ]; then
+    echo "sign.sh: the signing certificate expired on $when." >&2
+    echo "Every macOS release fails until it is replaced. See the rotation" >&2
+    echo "notes in the stepss umbrella CLAUDE.md." >&2
+    exit 1
+  fi
+  if [ "$days" -lt 365 ]; then
+    echo "sign.sh: WARNING, the signing certificate expires in $days days, on $when." >&2
+  fi
+  echo "Certificate valid for $days more days."
+}
+
 main() {
   local cmd="${1:-}"
   [ -n "$cmd" ] || { usage; exit 2; }
   shift
   case "$cmd" in
     preflight) cmd_preflight "$@" ;;
+    cert-expiry) cmd_cert_expiry "$@" ;;
     *) echo "sign.sh: unknown command: $cmd" >&2; usage; exit 2 ;;
   esac
 }
